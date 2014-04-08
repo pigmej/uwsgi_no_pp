@@ -10,7 +10,7 @@
 
 extern struct uwsgi_server uwsgi;
 
-#define REQ_DATA wsgi_req->method_len, wsgi_req->method, wsgi_req->uri_len, wsgi_req->uri, wsgi_req->remote_addr_len, wsgi_req->remote_addr 
+#define REQ_DATA wsgi_req->method_len, wsgi_req->method, wsgi_req->uri_len, wsgi_req->uri, wsgi_req->remote_addr_len, wsgi_req->remote_addr
 
 static struct uwsgi_buffer *uwsgi_websocket_message(struct wsgi_request *wsgi_req, char *msg, size_t len, uint8_t opcode) {
 	struct uwsgi_buffer *ub = wsgi_req->websocket_send_buf;
@@ -55,6 +55,7 @@ static int uwsgi_websockets_pong(struct wsgi_request *wsgi_req) {
 }
 
 static int uwsgi_websockets_check_pingpong(struct wsgi_request *wsgi_req) {
+        return 0;
 	time_t now = uwsgi_now();
 	// first round
 	if (wsgi_req->websocket_last_ping == 0) {
@@ -157,12 +158,12 @@ static struct uwsgi_buffer *uwsgi_websockets_parse(struct wsgi_request *wsgi_req
 	if (wsgi_req->websocket_has_mask) {
 		uint8_t *mask = ptr-4;
 		for(i=0;i<wsgi_req->websocket_size;i++) {
-			ptr[i] = ptr[i] ^ mask[i%4];	
+			ptr[i] = ptr[i] ^ mask[i%4];
 		}
 	}
 
 	struct uwsgi_buffer *ub = uwsgi_buffer_new(wsgi_req->websocket_size);
-	if (uwsgi_buffer_append(ub, (char *) ptr, wsgi_req->websocket_size)) goto error;	
+	if (uwsgi_buffer_append(ub, (char *) ptr, wsgi_req->websocket_size)) goto error;
 	if (uwsgi_buffer_decapitate(wsgi_req->websocket_buf, wsgi_req->websocket_pktsize)) goto error;
 	wsgi_req->websocket_phase = 0;
 	wsgi_req->websocket_need = 2;
@@ -304,11 +305,11 @@ static struct uwsgi_buffer *uwsgi_websocket_recv_do(struct wsgi_request *wsgi_re
 							wsgi_req->websocket_last_pong = uwsgi_now();
 							break;
 						default:
-							break;	
+							break;
 					}
 					// reset the status
-					wsgi_req->websocket_phase = 0;	
-					wsgi_req->websocket_need = 2;	
+					wsgi_req->websocket_phase = 0;
+					wsgi_req->websocket_need = 2;
 					// decapitate the buffer
 					if (uwsgi_buffer_decapitate(wsgi_req->websocket_buf, wsgi_req->websocket_pktsize)) return NULL;
 					break;
@@ -327,7 +328,7 @@ static struct uwsgi_buffer *uwsgi_websocket_recv_do(struct wsgi_request *wsgi_re
 					// return an empty buffer to signal blocking event
 					return uwsgi_buffer_new(0);
 				}
-				return NULL;	
+				return NULL;
 			}
 			// update buffer size
 			wsgi_req->websocket_buf->pos+=len;
@@ -393,7 +394,7 @@ int uwsgi_websocket_handshake(struct wsgi_request *wsgi_req, char *key, uint16_t
         else {
 		if (uwsgi_response_add_header(wsgi_req, "Sec-WebSocket-Origin", 20, "*", 1)) return -1;
         }
-	
+
 	// if protocol was requested or proto_len is specified, send it back
 	if (wsgi_req->http_sec_websocket_protocol_len > 0 || proto_len > 0) {
 		if (!proto_len) {
