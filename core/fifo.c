@@ -80,6 +80,7 @@ void uwsgi_master_fifo_prepare() {
 
 	uwsgi_fifo_table['-'] = uwsgi_cheaper_decrease;
 	uwsgi_fifo_table['+'] = uwsgi_cheaper_increase;
+	uwsgi_fifo_table['B'] = vassal_sos; 
 	uwsgi_fifo_table['c'] = uwsgi_chain_reload;
 	uwsgi_fifo_table['C'] = uwsgi_go_cheap;
 	uwsgi_fifo_table['E'] = emperor_rescan;
@@ -131,6 +132,7 @@ int uwsgi_master_fifo_manage(int fd) {
 	}
 	// fifo destroyed, recreate it
 	else if (rlen == 0) {
+		event_queue_del_fd(uwsgi.master_queue, uwsgi.master_fifo_fd, event_queue_read());
 		close(fd);
 		uwsgi.master_fifo_fd = uwsgi_master_fifo();
 		event_queue_add_fd_read(uwsgi.master_queue, uwsgi.master_fifo_fd);

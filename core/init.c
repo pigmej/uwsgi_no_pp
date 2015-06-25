@@ -3,9 +3,9 @@
 extern struct uwsgi_server uwsgi;
 
 struct http_status_codes {
-        const char key[3];
-        const char *message;
-        int message_size;
+        const char      key[3];
+        const char      *message;
+        int             message_size;
 };
 
 /* statistically ordered */
@@ -61,6 +61,7 @@ struct http_status_codes hsc[] = {
 void uwsgi_init_default() {
 
 	uwsgi.cpus = 1;
+	uwsgi.new_argc = -1;
 
 	uwsgi.backtrace_depth = 64;
 	uwsgi.max_apps = 64;
@@ -73,7 +74,7 @@ void uwsgi_init_default() {
 
 	uwsgi.stats_pusher_default_freq = 3;
 
-	uwsgi.original_log_fd = -1;
+	uwsgi.original_log_fd = 2;
 
 	uwsgi.emperor_fd_config = -1;
 	uwsgi.emperor_fd_proxy = -1;
@@ -105,14 +106,17 @@ void uwsgi_init_default() {
 
 	uwsgi.forkbomb_delay = 2;
 
-	uwsgi.async = 1;
+	uwsgi.async = 0;
+	uwsgi.async_warn_if_queue_full = 1;
 	uwsgi.listen_queue = 100;
 
 	uwsgi.cheaper_overload = 3;
+	uwsgi.cheaper_idle = 10;
 
 	uwsgi.log_master_bufsize = 8192;
 
 	uwsgi.worker_reload_mercy = 60;
+	uwsgi.mule_reload_mercy = 60;
 
 	uwsgi.max_vars = MAX_VARS;
 	uwsgi.vec_size = 4 + 1 + (4 * MAX_VARS);
@@ -251,9 +255,20 @@ void uwsgi_commandline_config() {
 	int i;
 
 	uwsgi.option_index = -1;
+	// required in case we want to call getopt_long from the beginning
+	optind = 0;
+
+	int argc = uwsgi.argc;
+	char **argv = uwsgi.argv;
+
+	if (uwsgi.new_argc > -1 && uwsgi.new_argv) {
+		argc = uwsgi.new_argc;
+		argv = uwsgi.new_argv;
+	}
+
 
 	char *optname;
-	while ((i = getopt_long(uwsgi.argc, uwsgi.argv, uwsgi.short_options, uwsgi.long_options, &uwsgi.option_index)) != -1) {
+	while ((i = getopt_long(argc, argv, uwsgi.short_options, uwsgi.long_options, &uwsgi.option_index)) != -1) {
 
 		if (i == '?') {
 			uwsgi_log("getopt_long() error\n");
@@ -279,9 +294,9 @@ void uwsgi_commandline_config() {
 	uwsgi_log("optind:%d argc:%d\n", optind, uwsgi.argc);
 #endif
 
-	if (optind < uwsgi.argc) {
-		for (i = optind; i < uwsgi.argc; i++) {
-			char *lazy = uwsgi.argv[i];
+	if (optind < argc) {
+		for (i = optind; i < argc; i++) {
+			char *lazy = argv[i];
 			if (lazy[0] != '[') {
 				uwsgi_opt_load(NULL, lazy, NULL);
 				// manage magic mountpoint
@@ -406,7 +421,7 @@ pid_t uwsgi_daemonize2() {
 // fix/check related options
 void sanitize_args() {
 
-        if (uwsgi.async > 1) {
+        if (uwsgi.async > 0) {
                 uwsgi.cores = uwsgi.async;
         }
 
@@ -468,6 +483,10 @@ void sanitize_args() {
 	if ( uwsgi.cheaper_rss_limit_hard && uwsgi.cheaper_rss_limit_hard <= uwsgi.cheaper_rss_limit_soft) {
 		uwsgi_log("cheaper-rss-limit-hard value must be higher than cheaper-rss-limit-soft value\n");
 		exit(1);
+	}
+
+	if (uwsgi.evil_reload_on_rss || uwsgi.evil_reload_on_as) {
+		if (!uwsgi.mem_collector_freq) uwsgi.mem_collector_freq = 3;
 	}
 
 	/* here we try to choose if thunder lock is a good thing */

@@ -19,6 +19,7 @@ static void uwsgi_opt_setup_gevent(char *opt, char *value, void *null) {
 static struct uwsgi_option gevent_options[] = {
         {"gevent", required_argument, 0, "a shortcut enabling gevent loop engine with the specified number of async cores and optimal parameters", uwsgi_opt_setup_gevent, NULL, UWSGI_OPT_THREADS},
         {"gevent-monkey-patch", no_argument, 0, "call gevent.monkey.patch_all() automatically on startup", uwsgi_opt_true, &ugevent.monkey, 0},
+        {"gevent-early-monkey-patch", no_argument, 0, "call gevent.monkey.patch_all() automatically before app loading", uwsgi_opt_true, &ugevent.early_monkey, 0},
         {"gevent-wait-for-hub", no_argument, 0, "wait for gevent hub's death instead of the control greenlet", uwsgi_opt_true, &ugevent.wait_for_hub, 0},
         {0, 0, 0, 0, 0, 0, 0},
 
@@ -100,12 +101,37 @@ retry:
 	return Py_None;
 }
 
-static void uwsgi_gevent_gbcw() {
+PyObject *py_uwsgi_gevent_int(PyObject *self, PyObject *args) {
+
+        uwsgi_log("Brutally killing worker %d (pid: %d)...\n", uwsgi.mywid, uwsgi.mypid);
+        uwsgi.workers[uwsgi.mywid].manage_next_request = 0;
+
+        uwsgi_log_verbose("stopping gevent signals watchers for worker %d (pid: %d)...\n", uwsgi.mywid, uwsgi.mypid);
+        PyObject_CallMethod(ugevent.my_signal_watcher, "stop", NULL);
+        PyObject_CallMethod(ugevent.signal_watcher, "stop", NULL);
+
+        uwsgi_log_verbose("stopping gevent sockets watchers for worker %d (pid: %d)...\n", uwsgi.mywid, uwsgi.mypid);
+        int i,count = uwsgi_count_sockets(uwsgi.sockets);
+        for(i=0;i<count;i++) {
+                PyObject_CallMethod(ugevent.watchers[i], "stop", NULL);
+        }
+        uwsgi_log_verbose("main gevent watchers stopped for worker %d (pid: %d)...\n", uwsgi.mywid, uwsgi.mypid);
+
+        if (!ugevent.wait_for_hub) {
+                PyObject_CallMethod(ugevent.ctrl_gl, "kill", NULL);
+        }
+
+        Py_INCREF(Py_None);
+        return Py_None;
+}
+
+
+static void uwsgi_gevent_gbcw(const char *reason) {
 
 	// already running
 	if (ugevent.destroy) return;
 
-	uwsgi_log("...The work of process %d is done. Seeya!\n", getpid());
+	uwsgi_log("...The work of process %d is done (reason: %s). Seeya!\n", getpid(), (reason != NULL ? reason : "no reason given"));
 
 	uwsgi_time_bomb(uwsgi.worker_reload_mercy, 0);
 	
@@ -140,7 +166,7 @@ PyObject *py_uwsgi_gevent_signal_handler(PyObject * self, PyObject * args) {
         	return NULL;
 	}
 
-	uwsgi_receive_signal(signal_socket, "worker", uwsgi.mywid);
+	uwsgi_receive_signal(NULL, signal_socket, "worker", uwsgi.mywid);
 
 	Py_INCREF(Py_None);
 	return Py_None;
@@ -180,12 +206,14 @@ PyObject *py_uwsgi_gevent_main(PyObject * self, PyObject * args) {
 	// hack to retrieve the socket address
 	PyObject *py_uwsgi_sock = PyTuple_GetItem(args, 0);
         struct uwsgi_socket *uwsgi_sock = (struct uwsgi_socket *) PyLong_AsLong(py_uwsgi_sock);
+        long watcher_index = PyInt_AsLong(PyTuple_GetItem(args, 1));
 	struct wsgi_request *wsgi_req = NULL;
 edge:
 	wsgi_req = find_first_available_wsgi_req();
 
 	if (wsgi_req == NULL) {
 		uwsgi_async_queue_is_full(uwsgi_now());
+                PyObject_CallMethod(ugevent.watchers[watcher_index], "stop", NULL);
 		goto clear;
 	}
 
@@ -211,7 +239,7 @@ edge:
 
 	// enter harakiri mode
         if (uwsgi.harakiri_options.workers > 0) {
-                set_harakiri(uwsgi.harakiri_options.workers);
+                set_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
         }
 
 	// hack to easily pass wsgi_req pointer to the greenlet
@@ -233,6 +261,10 @@ clear:
 	return Py_None;
 }
 
+PyObject *uwsgi_gevent_main;
+void start_watcher(int i, struct uwsgi_socket* uwsgi_sock) {
+        PyObject_CallMethod(ugevent.watchers[i], "start", "Oli", uwsgi_gevent_main,(long)uwsgi_sock, i);
+}
 
 PyObject *py_uwsgi_gevent_request(PyObject * self, PyObject * args) {
 
@@ -249,7 +281,7 @@ PyObject *py_uwsgi_gevent_request(PyObject * self, PyObject * args) {
 	if (wsgi_req->socket->edge_trigger) {
 		int status = wsgi_req->socket->proto(wsgi_req);
 		if (status < 0) {
-			goto end2;
+			goto end;
 		}
 		goto request;
 	}
@@ -294,7 +326,7 @@ end:
 	if (greenlet_switch) {
 		Py_DECREF(greenlet_switch);
 	}
-end2:
+
 	Py_DECREF(current_greenlet);
 
 	uwsgi_close_request(wsgi_req);
@@ -304,22 +336,34 @@ end2:
 	if (uwsgi.workers[uwsgi.mywid].manage_next_request == 0) {
 		int running_cores = 0;
 		int i;
-          for(i=0;i<uwsgi.async;i++) {
-            if (uwsgi.workers[uwsgi.mywid].cores[i].in_request) {
-              running_cores++;
-            }
-          }
+                for(i=0;i<uwsgi.async;i++) {
+                        if (uwsgi.workers[uwsgi.mywid].cores[i].in_request) {
+                                running_cores++;
+                        }
+                }
 
-          if (running_cores == 0) {
-            // no need to worry about freeing memory
-            PyObject *uwsgi_dict = get_uwsgi_pydict("uwsgi");
-            if (uwsgi_dict) {
-              PyObject *ae = PyDict_GetItemString(uwsgi_dict, "atexit");
-              if (ae) {
-                python_call(ae, PyTuple_New(0), 0, NULL);
-              }
-            }
-          }
+                if (running_cores == 0) {
+                        // no need to worry about freeing memory
+                        PyObject *uwsgi_dict = get_uwsgi_pydict("uwsgi");
+                        if (uwsgi_dict) {
+                                PyObject *ae = PyDict_GetItemString(uwsgi_dict, "atexit");
+                                if (ae) {
+                                        python_call(ae, PyTuple_New(0), 0, NULL);
+                                }
+                        }
+                }
+        } else {
+                // If we stopped any watcher due to being out of async workers, restart it.
+                int i = 0;
+                struct uwsgi_socket *uwsgi_sock = uwsgi.sockets;
+                for (; uwsgi_sock; uwsgi_sock = uwsgi_sock->next, ++i) {
+                        PyObject *py_watcher_active = PyObject_GetAttrString(ugevent.watchers[i], "active");
+                        if (py_watcher_active && PyBool_Check(py_watcher_active) &&
+                            !PyInt_AsLong(py_watcher_active)) {
+                            start_watcher(i, uwsgi_sock);
+                        }
+                        Py_DECREF(py_watcher_active);
+                }
         }
 
 	Py_INCREF(Py_None);
@@ -333,6 +377,7 @@ PyMethodDef uwsgi_gevent_signal_def[] = { {"uwsgi_gevent_signal", py_uwsgi_geven
 PyMethodDef uwsgi_gevent_my_signal_def[] = { {"uwsgi_gevent_my_signal", py_uwsgi_gevent_my_signal, METH_VARARGS, ""} };
 PyMethodDef uwsgi_gevent_signal_handler_def[] = { {"uwsgi_gevent_signal_handler", py_uwsgi_gevent_signal_handler, METH_VARARGS, ""} };
 PyMethodDef uwsgi_gevent_unix_signal_handler_def[] = { {"uwsgi_gevent_unix_signal_handler", py_uwsgi_gevent_graceful, METH_VARARGS, ""} };
+PyMethodDef uwsgi_gevent_unix_signal_int_handler_def[] = { {"uwsgi_gevent_unix_signal_int_handler", py_uwsgi_gevent_int, METH_VARARGS, ""} };
 PyMethodDef uwsgi_gevent_ctrl_gl_def[] = { {"uwsgi_gevent_ctrl_gl_handler", py_uwsgi_gevent_ctrl_gl, METH_VARARGS, ""} };
 
 static void gil_gevent_get() {
@@ -343,7 +388,18 @@ static void gil_gevent_release() {
 	PyGILState_Release((PyGILState_STATE) pthread_getspecific(up.upt_gil_key));
 }
 
+static void monkey_patch() {
+	PyObject *gevent_monkey_dict = get_uwsgi_pydict("gevent.monkey");
+        if (!gevent_monkey_dict) uwsgi_pyexit;
+        PyObject *gevent_monkey_patch_all = PyDict_GetItemString(gevent_monkey_dict, "patch_all");
+        if (!gevent_monkey_patch_all) uwsgi_pyexit;
+        PyObject *ret = python_call(gevent_monkey_patch_all, PyTuple_New(0), 0, NULL);
+        if (!ret) uwsgi_pyexit;
+}
 static void gevent_loop() {
+
+	// ensure SIGPIPE is ignored
+	signal(SIGPIPE, SIG_IGN);
 
 	if (!uwsgi.has_threads && uwsgi.mywid == 1) {
 		uwsgi_log("!!! Running gevent without threads IS NOT recommended, enable them with --enable-threads !!!\n");
@@ -365,7 +421,7 @@ static void gevent_loop() {
 
 	struct uwsgi_socket *uwsgi_sock = uwsgi.sockets;
 
-	if (uwsgi.async < 2) {
+	if (uwsgi.async < 1) {
 		uwsgi_log("the gevent loop engine requires async mode (--async <n>)\n");
 		exit(1);
 	}
@@ -385,12 +441,7 @@ static void gevent_loop() {
 
 	// call gevent.monkey.patch_all() if requested
 	if (ugevent.monkey) {
-		PyObject *gevent_monkey_dict = get_uwsgi_pydict("gevent.monkey");
-		if (!gevent_monkey_dict) uwsgi_pyexit;
-		PyObject *gevent_monkey_patch_all = PyDict_GetItemString(gevent_monkey_dict, "patch_all");
-        	if (!gevent_monkey_patch_all) uwsgi_pyexit;
-		PyObject *ret = python_call(gevent_monkey_patch_all, PyTuple_New(0), 0, NULL);
-		if (!ret) uwsgi_pyexit;
+		monkey_patch();
 	}
 
 	ugevent.spawn = PyDict_GetItemString(gevent_dict, "spawn");
@@ -421,7 +472,7 @@ static void gevent_loop() {
 	if (!ugevent.hub_loop) uwsgi_pyexit;
 
 	// main greenlet waiting for connection (one greenlet per-socket)
-	PyObject *uwsgi_gevent_main = PyCFunction_New(uwsgi_gevent_main_def, NULL);
+	uwsgi_gevent_main = PyCFunction_New(uwsgi_gevent_main_def, NULL);
 	Py_INCREF(uwsgi_gevent_main);
 
 	// greenlet to run at each request
@@ -468,7 +519,7 @@ static void gevent_loop() {
 		if (!ugevent.watchers[i]) uwsgi_pyexit;
 	
 		// start the main greenlet
-		PyObject_CallMethod(ugevent.watchers[i], "start", "Ol", uwsgi_gevent_main,(long)uwsgi_sock);
+		start_watcher(i, uwsgi_sock);
 		uwsgi_sock = uwsgi_sock->next;
 		i++;
 	}
@@ -484,6 +535,22 @@ static void gevent_loop() {
 	PyTuple_SetItem(ge_signal_tuple, 1, uwsgi_gevent_unix_signal_handler);
 
 	python_call(ugevent.signal, ge_signal_tuple, 0, NULL);
+
+	// map SIGINT/SIGTERM with gevent.signal
+	ge_signal_tuple = PyTuple_New(2);
+	PyTuple_SetItem(ge_signal_tuple, 0, PyInt_FromLong(SIGINT));
+	PyObject *uwsgi_gevent_unix_signal_int_handler = PyCFunction_New(uwsgi_gevent_unix_signal_int_handler_def, NULL);
+        Py_INCREF(uwsgi_gevent_unix_signal_int_handler);
+	PyTuple_SetItem(ge_signal_tuple, 1, uwsgi_gevent_unix_signal_int_handler);
+	python_call(ugevent.signal, ge_signal_tuple, 0, NULL);
+
+	ge_signal_tuple = PyTuple_New(2);
+	PyTuple_SetItem(ge_signal_tuple, 0, PyInt_FromLong(SIGTERM));
+	PyTuple_SetItem(ge_signal_tuple, 1, uwsgi_gevent_unix_signal_int_handler);
+	python_call(ugevent.signal, ge_signal_tuple, 0, NULL);
+
+
+
 
 	PyObject *wait_for_me = ugevent.hub;
 
@@ -528,8 +595,14 @@ static void gevent_loop() {
 
 }
 
-static void gevent_init() {
+static void gevent_preinit_apps() {
+	// call gevent.monkey.patch_all() if requested
+        if (ugevent.early_monkey) {
+                monkey_patch();
+        }
+}
 
+static void gevent_init() {
 	uwsgi_register_loop( (char *) "gevent", gevent_loop);
 }
 
@@ -538,5 +611,6 @@ struct uwsgi_plugin gevent_plugin = {
 
 	.name = "gevent",
 	.options = gevent_options,
+	.preinit_apps = gevent_preinit_apps,
 	.on_load = gevent_init,
 };

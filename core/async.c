@@ -21,7 +21,7 @@ extern struct uwsgi_server uwsgi;
 
 // this is called whenever a new connection is ready, but there are no cores to handle it
 void uwsgi_async_queue_is_full(time_t now) {
-	if (now > uwsgi.async_queue_is_full) {
+	if (now > uwsgi.async_queue_is_full && uwsgi.async_warn_if_queue_full) {
 		uwsgi_log_verbose("[DANGER] async queue is full !!!\n");
 		uwsgi.async_queue_is_full = now;
 	}
@@ -165,7 +165,7 @@ static void async_expire_timeouts(uint64_t now) {
 
 int async_add_fd_read(struct wsgi_request *wsgi_req, int fd, int timeout) {
 
-	if (uwsgi.async < 2 || !uwsgi.async_waiting_fd_table){ 
+	if (uwsgi.async < 1 || !uwsgi.async_waiting_fd_table){ 
 		uwsgi_log_verbose("ASYNC call without async mode !!!\n");
 		return -1;
 	}
@@ -257,7 +257,7 @@ static int async_wait_fd_read2(int fd0, int fd1, int timeout, int *fd) {
 
 void async_add_timeout(struct wsgi_request *wsgi_req, int timeout) {
 
-	if (uwsgi.async < 2 || !uwsgi.rb_async_timeouts) {
+	if (uwsgi.async < 1 || !uwsgi.rb_async_timeouts) {
 		uwsgi_log_verbose("ASYNC call without async mode !!!\n");
 		return;
 	}
@@ -272,7 +272,7 @@ void async_add_timeout(struct wsgi_request *wsgi_req, int timeout) {
 
 int async_add_fd_write(struct wsgi_request *wsgi_req, int fd, int timeout) {
 
-	if (uwsgi.async < 2 || !uwsgi.async_waiting_fd_table) {
+	if (uwsgi.async < 1 || !uwsgi.async_waiting_fd_table) {
 		uwsgi_log_verbose("ASYNC call without async mode !!!\n");
 		return -1;
 	}
@@ -369,7 +369,8 @@ void async_schedule_to_req_green(void) {
 			uwsgi.schedule_fix(wsgi_req);
 		}
                 // switch after each yield
-                uwsgi.schedule_to_main(wsgi_req);
+		if (uwsgi.schedule_to_main)
+                	uwsgi.schedule_to_main(wsgi_req);
         }
 
 #ifdef UWSGI_ROUTING
@@ -384,7 +385,6 @@ end:
         wsgi_req->async_status = UWSGI_OK;
 	uwsgi.async_queue_unused_ptr++;
         uwsgi.async_queue_unused[uwsgi.async_queue_unused_ptr] = wsgi_req;
-	
 }
 
 static int uwsgi_async_wait_milliseconds_hook(int timeout) {
@@ -406,7 +406,7 @@ static int uwsgi_async_wait_milliseconds_hook(int timeout) {
 
 void async_loop() {
 
-	if (uwsgi.async < 2) {
+	if (uwsgi.async < 1) {
 		uwsgi_log("the async loop engine requires async mode (--async <n>)\n");
 		exit(1);
 	}
@@ -481,7 +481,12 @@ void async_loop() {
 
 			// signals are executed in the main stack... in the future we could have dedicated stacks for them
 			if (uwsgi.signal_socket > -1 && (interesting_fd == uwsgi.signal_socket || interesting_fd == uwsgi.my_signal_socket)) {
-				uwsgi_receive_signal(interesting_fd, "worker", uwsgi.mywid);
+				uwsgi.wsgi_req = find_first_available_wsgi_req();
+                                if (uwsgi.wsgi_req == NULL) {
+                                	uwsgi_async_queue_is_full((time_t)now);
+                                        continue; 
+                                }
+				uwsgi_receive_signal(uwsgi.wsgi_req, interesting_fd, "worker", uwsgi.mywid);
 				continue;
 			}
 

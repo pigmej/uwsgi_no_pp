@@ -7,8 +7,8 @@
 #define cr_add_timeout_fast(u, x, t) uwsgi_add_rb_timer(u->timeouts, t+x->current_timeout, x)
 #define cr_del_timeout(u, x) uwsgi_del_rb_timer(u->timeouts, x->timeout); free(x->timeout);
 
-#define uwsgi_cr_error(x, y) uwsgi_log("[uwsgi-%s key: %.*s client_addr: %s client_port: %s] %s: %s [%s line %d]\n", x->session->corerouter->short_name, x->session->main_peer ? x->session->main_peer->key_len : 0, x->session->main_peer ? x->session->main_peer->key: "", x->session->client_address, x->session->client_port, y, strerror(errno), __FILE__, __LINE__)
-#define uwsgi_cr_log(x, y, ...) uwsgi_log("[uwsgi-%s key: %.*s client_addr: %s client_port: %s]" y, x->session->corerouter->short_name, x->session->main_peer ? x->session->main_peer->key_len : 0, x->session->main_peer ? x->session->main_peer->key : "", x->session->client_address, x->session->client_port, __VA_ARGS__)
+#define uwsgi_cr_error(x, y) uwsgi_log("[uwsgi-%s key: %.*s client_addr: %s client_port: %s] %s: %s [%s line %d]\n", x->session->corerouter->short_name, (x == x->session->main_peer) ? (x->session->peers ? x->session->peers->key_len: 0) : x->key_len, (x == x->session->main_peer) ? (x->session->peers ? x->session->peers->key: "") : x->key, x->session->client_address, x->session->client_port, y, strerror(errno), __FILE__, __LINE__)
+#define uwsgi_cr_log(x, y, ...) uwsgi_log("[uwsgi-%s key: %.*s client_addr: %s client_port: %s]" y, x->session->corerouter->short_name,  (x == x->session->main_peer) ? (x->session->peers ? x->session->peers->key_len: 0) : x->key_len, (x == x->session->main_peer) ? (x->session->peers ? x->session->peers->key: "") : x->key, x->session->client_address, x->session->client_port, __VA_ARGS__)
 
 #define cr_try_again if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {\
                      	errno = EINPROGRESS;\
@@ -180,8 +180,8 @@ struct corerouter_peer {
 	uint16_t retries;
 
 	// parsed key
-        char *key;
-        uint16_t key_len;
+        char key[0xff];
+        uint8_t key_len;
 
 	uint8_t modifier1;
 	uint8_t modifier2;
@@ -190,6 +190,15 @@ struct corerouter_peer {
 	struct corerouter_peer *next;
 
 	int current_timeout;
+
+	ssize_t (*flush)(struct corerouter_peer *);
+        int is_flushing;
+
+	// maps 1:1 with subscription proto
+	char proto;
+
+	int is_buffering;
+	int buffering_fd;
 };
 
 struct uwsgi_corerouter {
@@ -271,7 +280,7 @@ struct uwsgi_corerouter {
         char *resubscribe_bind;
 
 	size_t buffer_size;
-
+	int fallback_on_no_key;
 };
 
 // a session is started when a client connect to the router

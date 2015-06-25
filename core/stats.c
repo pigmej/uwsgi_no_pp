@@ -551,25 +551,16 @@ struct uwsgi_stats_pusher *uwsgi_register_stats_pusher(char *name, void (*func) 
 static void stats_dump_var(char *k, uint16_t kl, char *v, uint16_t vl, void *data) {
 	struct uwsgi_stats *us = (struct uwsgi_stats *) data;
 	if (us->dirty) return;
-	uint16_t i;
-	// replace " with '
-	for(i=0;i<kl;i++) {
-		if (k[i] == '"') {
-			k[i] = '\'';
-		}
-	}
-	for(i=0;i<vl;i++) {
-		if (v[i] == '"') {
-			v[i] = '\'';
-		}
-	}
 	char *var = uwsgi_concat3n(k, kl, "=", 1, v,vl);
-	if (uwsgi_stats_str(us, var)) {
+	char *escaped_var = uwsgi_malloc(((kl+vl+1)*2)+1);
+	escape_json(var, strlen(var), escaped_var);
+	free(var);
+	if (uwsgi_stats_str(us, escaped_var)) {
 		us->dirty = 1;
-		free(var);
+		free(escaped_var);
 		return;
 	}
-	free(var);
+	free(escaped_var);
 	if (uwsgi_stats_comma(us)) {
 		us->dirty = 1;
 	}	
@@ -578,14 +569,13 @@ static void stats_dump_var(char *k, uint16_t kl, char *v, uint16_t vl, void *dat
 
 int uwsgi_stats_dump_vars(struct uwsgi_stats *us, struct uwsgi_core *uc) {
 	if (!uc->in_request) return 0;
-	struct uwsgi_header *uh = (struct uwsgi_header *) uc->buffer;
-	uint16_t pktsize = uh->pktsize;
+	uint64_t pktsize = uc->req.len;
 	if (!pktsize) return 0;
 	char *dst = uwsgi.workers[0].cores[0].buffer;
 	memcpy(dst, uc->buffer+4, uwsgi.buffer_size);
 	// ok now check if something changed...
 	if (!uc->in_request) return 0;
-	if (uh->pktsize != pktsize) return 0;
+	if (uc->req.len != pktsize) return 0;
 	if (memcmp(dst, uc->buffer+4, uwsgi.buffer_size)) return 0;
 	// nothing changed let's dump vars
 	int ret = uwsgi_hooked_parse(dst, pktsize, stats_dump_var, us);

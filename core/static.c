@@ -167,6 +167,9 @@ static time_t parse_http_date(char *date, uint16_t len) {
 
 }
 
+time_t uwsgi_parse_http_date(char *buf, uint16_t len) {
+	return parse_http_date(buf, len);
+}
 
 
 int uwsgi_add_expires_type(struct wsgi_request *wsgi_req, char *mime_type, int mime_type_len, struct stat *st) {
@@ -459,24 +462,25 @@ int uwsgi_real_file_serve(struct wsgi_request *wsgi_req, char *real_filename, si
 	uwsgi_log("[uwsgi-fileserve] file %s found\n", real_filename);
 #endif
 
+	// static file - don't update avg_rt after request
+	wsgi_req->do_not_account_avg_rt = 1;
 
 	size_t fsize = st->st_size;
-        if (wsgi_req->range_to) {
-        	fsize = wsgi_req->range_to - wsgi_req->range_from;
-                if (fsize > (size_t)st->st_size) {
-                	fsize = st->st_size;
-                }
+	// security check
+        if (wsgi_req->range_from > fsize) {
+                wsgi_req->range_from = 0;
+                wsgi_req->range_to = 0;
         }
 	else {
-        	// reset in case of inconsistent size
-        	if (wsgi_req->range_from > fsize) {
-        		wsgi_req->range_from = 0;
-        		fsize = 0;
-        	}
-		else {
-			fsize -= wsgi_req->range_from;
-		}
+		fsize -= wsgi_req->range_from;
 	}
+
+        if (wsgi_req->range_to) {
+        	fsize = (wsgi_req->range_to - wsgi_req->range_from)+1;
+                if (fsize + wsgi_req->range_from > (size_t) (st->st_size)) {
+                	fsize = st->st_size - wsgi_req->range_from;
+                }
+        }
 
 	// HTTP status
 	if (fsize > 0 && (wsgi_req->range_from || wsgi_req->range_to)) {

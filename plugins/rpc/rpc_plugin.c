@@ -142,7 +142,7 @@ static int uwsgi_rpc_request(struct wsgi_request *wsgi_req) {
 	size_t content_len = 0;
 
 	/* Standard RPC request */
-        if (!wsgi_req->uh->pktsize) {
+        if (!wsgi_req->len) {
                 uwsgi_log("Empty RPC request. skip.\n");
                 return -1;
         }
@@ -226,7 +226,7 @@ static int uwsgi_rpc_request(struct wsgi_request *wsgi_req) {
 	}
 #endif
 
-	if (uwsgi_parse_array(wsgi_req->buffer, wsgi_req->uh->pktsize, argv, argvs, &argc)) {
+	if (uwsgi_parse_array(wsgi_req->buffer, wsgi_req->uh->_pktsize, argv, argvs, &argc)) {
                 uwsgi_log("Invalid RPC request. skip.\n");
                 return -1;
 	}
@@ -247,7 +247,7 @@ static int uwsgi_rpc_request(struct wsgi_request *wsgi_req) {
 				return -1;	
 			}
 			// fix uwsgi header
-			wsgi_req->uh->pktsize = ub->pos;
+			wsgi_req->uh->_pktsize = ub->pos;
 			if (uwsgi_response_write_body_do(wsgi_req, (char *) wsgi_req->uh, 4)) {
 				uwsgi_buffer_destroy(ub);
 				free(response_buf);	
@@ -261,7 +261,7 @@ static int uwsgi_rpc_request(struct wsgi_request *wsgi_req) {
 			uwsgi_buffer_destroy(ub);
 		}
 		else {
-			wsgi_req->uh->pktsize = content_len;
+			wsgi_req->uh->_pktsize = content_len;
 			if (uwsgi_response_write_body_do(wsgi_req, (char *) wsgi_req->uh, 4)) {
 				free(response_buf);	
 				return -1;
@@ -279,6 +279,38 @@ sendbody:
 }
 
 #ifdef UWSGI_ROUTING
+static int uwsgi_rpc_apply_translations(struct wsgi_request *wsgi_req, struct uwsgi_route *ur, struct uwsgi_buffer **ubs, uint64_t *ubs_len, char **argv, uint16_t *argvs) {
+	uint64_t i;
+	char **r_argv = (char **) ur->data2;
+	uint16_t *r_argvs = (uint16_t *) ur->data3;
+
+	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
+	uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
+
+	for(i=0;i<ur->custom;i++) {
+		ubs[i] = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, r_argv[i], r_argvs[i]);
+		if (!ubs[i]) {
+			*ubs_len = i;
+			return 0;
+		}
+		argv[i] = ubs[i]->buf;
+		argvs[i] = ubs[i]->pos;
+	}
+
+	*ubs_len = i;
+	return 1;
+}
+
+static char *uwsgi_rpc_get_remote(char *func) {
+	char *remote = NULL;
+	char *at = strchr(func, '@');
+	if (at) {
+		*at = 0;
+		remote = at+1;
+	}
+	return remote;
+}
+
 static int uwsgi_routing_func_rpc(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
 	int ret = -1;
 	// this is the list of args
@@ -288,28 +320,13 @@ static int uwsgi_routing_func_rpc(struct wsgi_request *wsgi_req, struct uwsgi_ro
 	// this is a placeholder for tmp uwsgi_buffers
 	struct uwsgi_buffer *ubs[UMAX8];
 
-	char **r_argv = (char **) ur->data2;
-	uint16_t *r_argvs = (uint16_t *) ur->data3;
-
-	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
-        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
-
 	uint64_t i;
-	for(i=0;i<ur->custom;i++) {
-		ubs[i] = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, r_argv[i], r_argvs[i]);
-		if (!ubs[i]) goto end;
-		argv[i] = ubs[i]->buf;
-		argvs[i] = ubs[i]->pos;
-	}
+	if (!uwsgi_rpc_apply_translations(wsgi_req, ur, ubs, &i, argv, argvs))
+		goto end;
 
 	// ok we now need to check it it is a local call or a remote one
 	char *func = uwsgi_str(ur->data);
-	char *remote = NULL;
-	char *at = strchr(func, '@');
-	if (at) {
-		*at = 0;
-		remote = at+1;
-	}
+	char *remote = uwsgi_rpc_get_remote(func);
 	uint64_t size;
 	char *response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
 	free(func);
@@ -340,28 +357,13 @@ static int uwsgi_routing_func_rpc_blob(struct wsgi_request *wsgi_req, struct uws
         // this is a placeholder for tmp uwsgi_buffers
         struct uwsgi_buffer *ubs[UMAX8];
 
-        char **r_argv = (char **) ur->data2;
-        uint16_t *r_argvs = (uint16_t *) ur->data3;
-
-        char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
-        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
-
         uint64_t i;
-        for(i=0;i<ur->custom;i++) {
-                ubs[i] = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, r_argv[i], r_argvs[i]);
-                if (!ubs[i]) goto end;
-                argv[i] = ubs[i]->buf;
-                argvs[i] = ubs[i]->pos;
-        }
+	if (!uwsgi_rpc_apply_translations(wsgi_req, ur, ubs, &i, argv, argvs))
+		goto end;
 
         // ok we now need to check it it is a local call or a remote one
         char *func = uwsgi_str(ur->data);
-        char *remote = NULL;
-        char *at = strchr(func, '@');
-        if (at) {
-                *at = 0;
-                remote = at+1;
-        }
+	char *remote = uwsgi_rpc_get_remote(func);
         uint64_t size;
         char *response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
         free(func);
@@ -387,6 +389,7 @@ end:
 }
 
 static int uwsgi_routing_func_rpc_raw(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
+	char *response = NULL;
         int ret = -1;
         // this is the list of args
         char *argv[UMAX8];
@@ -395,30 +398,15 @@ static int uwsgi_routing_func_rpc_raw(struct wsgi_request *wsgi_req, struct uwsg
         // this is a placeholder for tmp uwsgi_buffers
         struct uwsgi_buffer *ubs[UMAX8];
 
-        char **r_argv = (char **) ur->data2;
-        uint16_t *r_argvs = (uint16_t *) ur->data3;
-
-        char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
-        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
-
         uint64_t i;
-        for(i=0;i<ur->custom;i++) {
-                ubs[i] = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, r_argv[i], r_argvs[i]);
-                if (!ubs[i]) goto end;
-                argv[i] = ubs[i]->buf;
-                argvs[i] = ubs[i]->pos;
-        }
+	if (!uwsgi_rpc_apply_translations(wsgi_req, ur, ubs, &i, argv, argvs))
+		goto end;
 
         // ok we now need to check it it is a local call or a remote one
         char *func = uwsgi_str(ur->data);
-        char *remote = NULL;
-        char *at = strchr(func, '@');
-        if (at) {
-                *at = 0;
-                remote = at+1;
-        }
+	char *remote = uwsgi_rpc_get_remote(func);
         uint64_t size;
-        char *response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
+        response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
         free(func);
         if (!response) goto end;
 
@@ -426,12 +414,13 @@ static int uwsgi_routing_func_rpc_raw(struct wsgi_request *wsgi_req, struct uwsg
 	if (size == 0) goto end;
 
 	ret = uwsgi_blob_to_response(wsgi_req, response, size);
-        free(response);
 	if (ret == 0) {
 		ret = UWSGI_ROUTE_BREAK;
 	}
 
 end:
+	free(response);
+
         for(i=0;i<ur->custom;i++) {
                 if (ubs[i] != NULL) {
                         uwsgi_buffer_destroy(ubs[i]);
@@ -441,6 +430,7 @@ end:
 }
 
 static int uwsgi_routing_func_rpc_var(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
+        char *response = NULL;
         int ret = -1;
         // this is the list of args
         char *argv[UMAX8];
@@ -449,30 +439,15 @@ static int uwsgi_routing_func_rpc_var(struct wsgi_request *wsgi_req, struct uwsg
         // this is a placeholder for tmp uwsgi_buffers
         struct uwsgi_buffer *ubs[UMAX8];
 
-        char **r_argv = (char **) ur->data2;
-        uint16_t *r_argvs = (uint16_t *) ur->data3;
-
-        char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
-        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
-
         uint64_t i;
-        for(i=0;i<ur->custom;i++) {
-                ubs[i] = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, r_argv[i], r_argvs[i]);
-                if (!ubs[i]) goto end;
-                argv[i] = ubs[i]->buf;
-                argvs[i] = ubs[i]->pos;
-        }
+	if (!uwsgi_rpc_apply_translations(wsgi_req, ur, ubs, &i, argv, argvs))
+		goto end;
 
         // ok we now need to check it it is a local call or a remote one
         char *func = uwsgi_str(ur->data);
-        char *remote = NULL;
-        char *at = strchr(func, '@');
-        if (at) {
-                *at = 0;
-                remote = at+1;
-        }
+	char *remote = uwsgi_rpc_get_remote(func);
         uint64_t size;
-        char *response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
+        response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
         free(func);
         if (!response) goto end;
 
@@ -480,12 +455,11 @@ static int uwsgi_routing_func_rpc_var(struct wsgi_request *wsgi_req, struct uwsg
         if (size == 0) goto end;
 
 	if (!uwsgi_req_append(wsgi_req, ur->data4, ur->data4_len, response, size)) {
-		free(response);
 		goto end;
 	}
-	free(response);
 	ret = UWSGI_ROUTE_NEXT;
 end:
+	free(response);
         for(i=0;i<ur->custom;i++) {
                 if (ubs[i] != NULL) {
                         uwsgi_buffer_destroy(ubs[i]);
@@ -506,28 +480,13 @@ static int uwsgi_routing_func_rpc_ret(struct wsgi_request *wsgi_req, struct uwsg
         // this is a placeholder for tmp uwsgi_buffers
         struct uwsgi_buffer *ubs[UMAX8];
 
-        char **r_argv = (char **) ur->data2;
-        uint16_t *r_argvs = (uint16_t *) ur->data3;
-
-        char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
-        uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
-
         uint64_t i;
-        for(i=0;i<ur->custom;i++) {
-                ubs[i] = uwsgi_routing_translate(wsgi_req, ur, *subject, *subject_len, r_argv[i], r_argvs[i]);
-                if (!ubs[i]) goto end;
-                argv[i] = ubs[i]->buf;
-                argvs[i] = ubs[i]->pos;
-        }
+	if (!uwsgi_rpc_apply_translations(wsgi_req, ur, ubs, &i, argv, argvs))
+		goto end;
 
         // ok we now need to check it it is a local call or a remote one
         char *func = uwsgi_str(ur->data);
-        char *remote = NULL;
-        char *at = strchr(func, '@');
-        if (at) {
-                *at = 0;
-                remote = at+1;
-        }
+	char *remote = uwsgi_rpc_get_remote(func);
         uint64_t size;
         char *response = uwsgi_do_rpc(remote, func, ur->custom, argv, argvs, &size);
         free(func);

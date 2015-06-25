@@ -24,6 +24,15 @@ void uwsgi_curse(int wid, int sig) {
 	}
 }
 
+void uwsgi_curse_mule(int mid, int sig) {
+	uwsgi.mules[mid].cursed_at = uwsgi_now();
+	uwsgi.mules[mid].no_mercy_at = uwsgi.mules[mid].cursed_at + uwsgi.mule_reload_mercy;
+
+	if (sig) {
+		(void) kill(uwsgi.mules[mid].pid, sig);
+	}
+}
+
 static void uwsgi_signal_spoolers(int signum) {
 
         struct uwsgi_spooler *uspool = uwsgi.spoolers;
@@ -50,15 +59,6 @@ void uwsgi_destroy_processes() {
                         kill(ushared->gateways[i].pid, SIGKILL);
 			waitpid(ushared->gateways[i].pid, &waitpid_status, 0);
 			uwsgi_log("gateway \"%s %d\" has been buried (pid: %d)\n", ushared->gateways[i].name, ushared->gateways[i].num, (int) ushared->gateways[i].pid);
-		}
-        }
-
-	// TODO mules can be programmed to be gracefully reloaded
-        for (i = 0; i < uwsgi.mules_cnt; i++) {
-                if (uwsgi.mules[i].pid > 0) {
-                        kill(uwsgi.mules[i].pid, SIGKILL);
-			waitpid(uwsgi.mules[i].pid, &waitpid_status, 0);
-			uwsgi_log("mule %d has been buried (pid: %d)\n", i, (int) uwsgi.mules[i].pid);
 		}
         }
 
@@ -162,6 +162,7 @@ int uwsgi_calc_cheaper(void) {
 			ignore_algo = 1;
 		}
 		uwsgi.cheaper_fifo_delta = 0;
+		goto safe;
 	}
 
 	// if cheaper limits wants to change worker count, then skip cheaper algo
@@ -172,6 +173,7 @@ int uwsgi_calc_cheaper(void) {
 		needed_workers = 0;
 	}
 
+safe:
 	if (needed_workers > 0) {
 		for (i = 1; i <= uwsgi.numproc; i++) {
 			if (uwsgi.workers[i].cheaped == 1 && uwsgi.workers[i].pid == 0) {
@@ -219,7 +221,7 @@ int uwsgi_cheaper_algo_manual(int can_spawn) {
         -- Cheaper, spare algorithm, adapted from old-fashioned spare system --
         
         when all of the workers are busy, the overload_count is incremented.
-        as soon as overload_count is higher than uwsgi.cheaper_overload (--cheaper-overload options)
+        as soon as overload_count reaches to uwsgi.cheaper_overload (--cheaper-overload options)
         at most cheaper_step (default to 1) new workers are spawned.
 
         when at least one worker is free, the overload_count is decremented and the idle_count is incremented.
@@ -273,7 +275,7 @@ int uwsgi_cheaper_algo_spare(int can_spawn) {
 healthy:
 
 	// are we overloaded ?
-	if (can_spawn && overload_count > uwsgi.cheaper_overload) {
+	if (can_spawn && overload_count >= uwsgi.cheaper_overload) {
 
 #ifdef UWSGI_DEBUG
 		uwsgi_log("overloaded !!!\n");
@@ -329,6 +331,72 @@ healthy:
 
 	return 0;
 
+}
+
+/*
+	-- Cheaper, spare2 algorithm, for large workload --
+
+	This algorithm is very similar to spare, but more suited for higher workload.
+
+	This algorithm increase workers *before* overloaded, and decrease workers slowly.
+
+	This algorithm uses these options: chaper, cheaper-initial, cheaper-step and cheaper-idle.
+
+	* When number of idle workers is smaller than cheaper count, increase
+	  min(cheaper-step, cheaper - idle workers) workers.
+	* When number of idle workers is larger than cheaper count, increase idle_count.
+		* When idle_count >= cheaper-idle, decrease worker.
+*/
+int uwsgi_cheaper_algo_spare2(int can_spawn) {
+	static int idle_count = 0;
+	int i, idle_workers, busy_workers, cheaped_workers;
+
+	// count the number of idle and busy workers
+	idle_workers = busy_workers = 0;
+	for (i = 1; i <= uwsgi.numproc; i++) {
+		if (uwsgi.workers[i].cheaped == 0 && uwsgi.workers[i].pid > 0) {
+			if (uwsgi_worker_is_busy(i) == 1) {
+				busy_workers++;
+			} else {
+				idle_workers++;
+			}
+		}
+	}
+	cheaped_workers = uwsgi.numproc - (idle_workers + busy_workers);
+
+#ifdef UWSGI_DEBUG
+	uwsgi_log("cheaper-spare2: idle=%d, busy=%d, cheaped=%d, idle_count=%d\n",
+		idle_workers, busy_workers, cheaped_workers, idle_count);
+#endif
+
+	// should we increase workers?
+	if (idle_workers < uwsgi.cheaper_count) {
+		int spawn;
+		idle_count = 0;
+
+		if (!can_spawn)
+			return 0;
+
+		spawn = uwsgi.cheaper_count - idle_workers;
+		if (spawn > cheaped_workers)
+			spawn = cheaped_workers;
+		if (spawn > uwsgi.cheaper_step)
+			spawn = uwsgi.cheaper_step;
+		return spawn;
+	}
+
+	if (idle_workers == uwsgi.cheaper_count) {
+		idle_count = 0;
+		return 0;
+	}
+
+	// decrease workers
+	idle_count++;
+	if (idle_count < uwsgi.cheaper_idle)
+		return 0;
+
+	idle_count = 0;
+	return -1;
 }
 
 
@@ -387,6 +455,8 @@ int uwsgi_cheaper_algo_backlog(int can_spawn) {
 void uwsgi_reload(char **argv) {
 	int i;
 	int waitpid_status;
+
+	if (uwsgi.new_argv) argv = uwsgi.new_argv;
 
 	if (!uwsgi.master_is_reforked) {
 
@@ -630,7 +700,7 @@ void uwsgi_fixup_fds(int wid, int muleid, struct uwsgi_gateway *ug) {
 }
 
 int uwsgi_respawn_worker(int wid) {
-
+	int i;
 	int respawns = uwsgi.workers[wid].respawn_count;
 	// the workers is not accepting (obviously)
 	uwsgi.workers[wid].accepting = 0;
@@ -639,8 +709,10 @@ int uwsgi_respawn_worker(int wid) {
 	// ... same for update time
 	uwsgi.workers[wid].last_spawn = uwsgi.current_time;
 	// ... and memory/harakiri
-	uwsgi.workers[wid].harakiri = 0;
-	uwsgi.workers[wid].user_harakiri = 0;
+	for(i=0;i<uwsgi.cores;i++) {
+		uwsgi.workers[wid].cores[i].harakiri = 0;
+		uwsgi.workers[wid].cores[i].user_harakiri = 0;
+	}
 	uwsgi.workers[wid].pending_harakiri = 0;
 	uwsgi.workers[wid].rss_size = 0;
 	uwsgi.workers[wid].vsz_size = 0;
@@ -657,8 +729,6 @@ int uwsgi_respawn_worker(int wid) {
 
 	// this is required for various checks
 	uwsgi.workers[wid].delta_requests = 0;
-
-	int i;
 
 	if (uwsgi.threaded_logger) {
 		pthread_mutex_lock(&uwsgi.threaded_logger_lock);
@@ -716,6 +786,10 @@ int uwsgi_respawn_worker(int wid) {
 					}
 				}
 			}
+		}
+
+		if (uwsgi.threaded_logger) {
+			pthread_mutex_unlock(&uwsgi.threaded_logger_lock);
 		}
 
 		return 1;
@@ -796,7 +870,7 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 
 			// allocate 2x the size of original command
 			// in case we need to escape all chars
-			char *cmd = uwsgi_malloc(strlen(ud->command)*2);
+			char *cmd = uwsgi_malloc((strlen(ud->command)*2)+1);
 			escape_json(ud->command, strlen(ud->command), cmd);
 			if (uwsgi_stats_keyval_comma(us, "cmd", cmd)) {
 				free(cmd);
@@ -913,7 +987,7 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 		goto end;
 	}
 
-	if (uwsgi.has_metrics) {
+	if (uwsgi.has_metrics && !uwsgi.stats_no_metrics) {
 		if (uwsgi_stats_key(us, "metrics"))
                 	goto end;
 
@@ -1145,6 +1219,8 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 		if (uwsgi_stats_list_close(us))
 			goto end;
 
+		if (uwsgi.stats_no_cores) goto nocores;
+
 		if (uwsgi_stats_comma(us))
 			goto end;
 
@@ -1206,8 +1282,11 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 		if (uwsgi_stats_list_close(us))
 			goto end;
 
+nocores:
+
 		if (uwsgi_stats_object_close(us))
 			goto end;
+
 
 		if (i < uwsgi.numproc - 1) {
 			if (uwsgi_stats_comma(us))
@@ -1284,7 +1363,7 @@ struct uwsgi_stats *uwsgi_master_generate_stats() {
 			if (uwsgi_stats_keyslong_comma(us, "week", (long long) ucron->week))
 				goto end;
 
-			char *cmd = uwsgi_malloc(strlen(ucron->command)*2);
+			char *cmd = uwsgi_malloc((strlen(ucron->command)*2)+1);
 			escape_json(ucron->command, strlen(ucron->command), cmd);
 			if (uwsgi_stats_keyval_comma(us, "command", cmd)) {
 				free(cmd);
@@ -1714,6 +1793,7 @@ void uwsgi_setns_preopen() {
         }
         while ((de = readdir(ns)) != NULL) {
                 if (strlen(de->d_name) > 0 && de->d_name[0] == '.') continue;
+		if (!strcmp(de->d_name, "user")) continue;
                 struct uwsgi_string_list *usl = NULL;
                 int found = 0;
                 uwsgi_foreach(usl, uwsgi.setns_socket_skip) {
@@ -1772,6 +1852,7 @@ void uwsgi_master_manage_setns(int fd) {
 	}
 	while ((de = readdir(ns)) != NULL) {
 		if (strlen(de->d_name) > 0 && de->d_name[0] == '.') continue;
+		if (!strcmp(de->d_name, "user")) continue;
 		struct uwsgi_string_list *usl = NULL;
 		int found = 0;
 		uwsgi_foreach(usl, uwsgi.setns_socket_skip) {
@@ -1854,3 +1935,5 @@ void uwsgi_dump_worker(int wid, char *msg) {
 	}
 	uwsgi_log_verbose("%s !!! end of worker %d status !!!\n",msg, wid);
 }
+
+/* vim: set ts=8 sts=0 sw=0 noexpandtab : */

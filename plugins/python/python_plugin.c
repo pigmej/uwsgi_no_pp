@@ -63,6 +63,29 @@ void uwsgi_opt_pyver(char *opt, char *foo, void *bar) {
 	exit(0);
 }
 
+int uwsgi_python_init(void);
+void uwsgi_python_preinit_apps(void);
+static void uwsgi_early_python(char *opt, char *foo, void *bar) {
+	static int early_initialized = 0;
+	if (early_initialized) return;
+	early_initialized = 1;
+	uwsgi_python_init();
+	uwsgi_python_preinit_apps();
+}
+
+
+static void uwsgi_early_python_import(char *opt, char *module, void *bar) {
+	uwsgi_early_python(opt, NULL, NULL);
+	if (strchr(module, '/') || uwsgi_endswith(module, ".py")) {
+        	uwsgi_pyimport_by_filename(uwsgi_pythonize(module), module);
+        }
+        else {
+        	if (PyImport_ImportModule(module) == NULL) {
+                	PyErr_Print();
+                }
+	}
+}
+
 
 void uwsgi_opt_ini_paste(char *opt, char *value, void *foobar) {
 
@@ -88,7 +111,7 @@ struct uwsgi_option uwsgi_python_options[] = {
 	{"module", required_argument,'w', "load a WSGI module", uwsgi_opt_set_str, &up.wsgi_config, 0},
 	{"wsgi", required_argument, 'w', "load a WSGI module", uwsgi_opt_set_str, &up.wsgi_config, 0},
 	{"callable", required_argument, 0, "set default WSGI callable name", uwsgi_opt_set_str, &up.callable, 0},
-	{"test", required_argument, 'J', "test a mdule import", uwsgi_opt_set_str, &up.test_module, 0},
+	{"test", required_argument, 'J', "test a module import", uwsgi_opt_set_str, &up.test_module, 0},
 	{"home", required_argument, 'H', "set PYTHONHOME/virtualenv", uwsgi_opt_set_str, &up.home, 0},
 	{"virtualenv", required_argument, 'H', "set PYTHONHOME/virtualenv", uwsgi_opt_set_str, &up.home, 0},
 	{"venv", required_argument, 'H', "set PYTHONHOME/virtualenv", uwsgi_opt_set_str, &up.home, 0},
@@ -167,6 +190,14 @@ struct uwsgi_option uwsgi_python_options[] = {
 #if defined(PYTHREE) || defined(Py_TPFLAGS_HAVE_NEWBUFFER)
 	{"py-sharedarea", required_argument, 0, "create a sharedarea from a python bytearray object of the specified size", uwsgi_opt_add_string_list, &up.sharedarea, 0},
 #endif
+
+	{"py-call-osafterfork", no_argument, 0, "enable child processes running cpython to trap OS signals", uwsgi_opt_true, &up.call_osafterfork, 0},
+
+	{"early-python", no_argument, 0, "load the python VM as soon as possible (useful for the fork server)", uwsgi_early_python, NULL, UWSGI_OPT_IMMEDIATE},
+	{"early-pyimport", required_argument, 0, "import a python module in the early phase", uwsgi_early_python_import, NULL, UWSGI_OPT_IMMEDIATE},
+	{"early-python-import", required_argument, 0, "import a python module in the early phase", uwsgi_early_python_import, NULL, UWSGI_OPT_IMMEDIATE},
+	{"early-pythonpath", required_argument, 0, "add directory (or glob) to pythonpath (immediate version)", uwsgi_opt_pythonpath, NULL,  UWSGI_OPT_IMMEDIATE},
+	{"early-python-path", required_argument, 0, "add directory (or glob) to pythonpath (immediate version)", uwsgi_opt_pythonpath, NULL,  UWSGI_OPT_IMMEDIATE},
 
 	{0, 0, 0, 0, 0, 0, 0},
 };
@@ -330,7 +361,7 @@ void uwsgi_python_atexit() {
 		return;
 
 	// managing atexit in async mode is a real pain...skip it for now
-	if (uwsgi.async > 1)
+	if (uwsgi.async > 0)
 		return;
 realstuff:
 
@@ -377,6 +408,11 @@ void uwsgi_python_post_fork() {
 		UWSGI_GET_GIL
 	}	
 
+	// reset python signal flags so child processes can trap signals
+	if (up.call_osafterfork) {
+		PyOS_AfterFork();
+	}
+
 	uwsgi_python_reset_random_seed();
 
 	// call the post_fork_hook
@@ -390,6 +426,7 @@ void uwsgi_python_post_fork() {
 	PyErr_Clear();
 
 	if (uwsgi.mywid > 0) {
+		uwsgi_python_set_thread_name(0);
 		if (up.auto_reload) {
 			// spawn the reloader thread
 			pthread_t par_tid;
@@ -913,12 +950,16 @@ int uwsgi_python_mount_app(char *mountpoint, char *app) {
 	if (strchr(app, ':') || uwsgi_endswith(app, ".py") || uwsgi_endswith(app, ".wsgi")) {
 		uwsgi.wsgi_req->appid = mountpoint;
 		uwsgi.wsgi_req->appid_len = strlen(mountpoint);
+		// lazy ?
+        	if (uwsgi.mywid > 0) UWSGI_GET_GIL
 		if (uwsgi.single_interpreter) {
 			id = init_uwsgi_app(LOADER_MOUNT, app, uwsgi.wsgi_req, up.main_thread, PYTHON_APP_TYPE_WSGI);
 		}
 		else {
 			id = init_uwsgi_app(LOADER_MOUNT, app, uwsgi.wsgi_req, NULL, PYTHON_APP_TYPE_WSGI);
 		}
+		// lazy ?
+        	if (uwsgi.mywid > 0) UWSGI_RELEASE_GIL
 		return id;
 	}
 	return -1;
@@ -1030,6 +1071,10 @@ void uwsgi_python_destroy_env_holy(struct wsgi_request *wsgi_req) {
 
 // this hook will be executed by master (or worker1 when master is not requested, so COW is in place)
 void uwsgi_python_preinit_apps() {
+	struct uwsgi_string_list *upli = up.shared_import_list;
+
+	if (up.pre_initialized) goto ready;
+	up.pre_initialized = 1;
 
 	init_pyargv();
 
@@ -1061,8 +1106,9 @@ void uwsgi_python_preinit_apps() {
 
         init_uwsgi_vars();
 
+ready:
+
 	// load shared imports
-	struct uwsgi_string_list *upli = up.shared_import_list;
 	while(upli) {
 		if (strchr(upli->value, '/') || uwsgi_endswith(upli->value, ".py")) {
 			uwsgi_pyimport_by_filename(uwsgi_pythonize(upli->value), upli->value);
@@ -1085,7 +1131,7 @@ void uwsgi_python_init_apps() {
 	}
 
 	// prepare for stack suspend/resume
-	if (uwsgi.async > 1) {
+	if (uwsgi.async > 0) {
 		up.current_recursion_depth = uwsgi_malloc(sizeof(int)*uwsgi.async);
         	up.current_frame = uwsgi_malloc(sizeof(struct _frame)*uwsgi.async);
 	}
@@ -1259,9 +1305,37 @@ void uwsgi_python_enable_threads() {
 		up.reset_ts = threaded_reset_ts;
 	}
 
+	
+
 	uwsgi_log("python threads support enabled\n");
 	
 
+}
+
+void uwsgi_python_set_thread_name(int core_id) {
+	// call threading.currentThread (taken from mod_wsgi, but removes DECREFs as thread in uWSGI are fixed)
+	PyObject *threading_module = PyImport_ImportModule("threading");
+        if (threading_module) {
+                PyObject *threading_module_dict = PyModule_GetDict(threading_module);
+                if (threading_module_dict) {
+#ifdef PYTHREE
+                        PyObject *threading_current = PyDict_GetItemString(threading_module_dict, "current_thread");
+#else
+                        PyObject *threading_current = PyDict_GetItemString(threading_module_dict, "currentThread");
+#endif
+                        if (threading_current) {
+                                PyObject *current_thread = PyEval_CallObject(threading_current, (PyObject *)NULL);
+                                if (!current_thread) {
+                                        // ignore the error
+                                        PyErr_Clear();
+                                }
+                                else {
+                                        PyObject_SetAttrString(current_thread, "name", PyString_FromFormat("uWSGIWorker%dCore%d", uwsgi.mywid, core_id));
+                                        Py_INCREF(current_thread);
+                                }
+                        }
+                }
+        }
 }
 
 void uwsgi_python_init_thread(int core_id) {
@@ -1275,29 +1349,7 @@ void uwsgi_python_init_thread(int core_id) {
 	uwsgi_log("python ThreadState %d = %p\n", core_id, pts);
 #endif
 	UWSGI_GET_GIL;
-	// call threading.currentThread (taken from mod_wsgi, but removes DECREFs as thread in uWSGI are fixed)
-	PyObject *threading_module = PyImport_ImportModule("threading");
-        if (threading_module) {
-        	PyObject *threading_module_dict = PyModule_GetDict(threading_module);
-                if (threading_module_dict) {
-#ifdef PYTHREE
-			PyObject *threading_current = PyDict_GetItemString(threading_module_dict, "current_thread");
-#else
-			PyObject *threading_current = PyDict_GetItemString(threading_module_dict, "currentThread");
-#endif
-                        if (threading_current) {
-                                PyObject *current_thread = PyEval_CallObject(threading_current, (PyObject *)NULL);
-                                if (!current_thread) {
-					// ignore the error
-                                        PyErr_Clear();
-                                }
-				else {
-					PyObject_SetAttrString(current_thread, "name", PyString_FromFormat("uWSGIWorker%dCore%d", uwsgi.mywid, core_id));
-					Py_INCREF(current_thread);
-				}
-                        }
-                }
-        }
+	uwsgi_python_set_thread_name(core_id);
 	UWSGI_RELEASE_GIL;
 	
 
@@ -1407,7 +1459,15 @@ void *uwsgi_python_autoreloader_thread(void *foobar) {
 			int found = 0;
 			struct uwsgi_string_list *usl = up.auto_reload_ignore;
 			while(usl) {
+#ifdef PYTHREE
+				PyObject *zero = PyUnicode_AsUTF8String(mod_name);
+				char *str_mod_name = PyString_AsString(zero);
+				int ret_cmp = strcmp(usl->value, str_mod_name);
+				Py_DECREF(zero);
+				if (!ret_cmp) {
+#else
 				if (!strcmp(usl->value, PyString_AsString(mod_name))) {
+#endif
 					found = 1;
 					break;
 				}
@@ -1644,6 +1704,8 @@ int uwsgi_python_spooler(char *filename, char *buf, uint16_t len, char *body, si
 		PyDict_SetItemString(spool_dict, "body", value);
 		Py_DECREF(value);
 	}
+	// PyTuple_SetItem steals a reference !!!
+	Py_INCREF(spool_dict);
 	PyTuple_SetItem(pyargs, 0, spool_dict);
 
 	ret = python_call(spool_func, pyargs, 0, NULL);

@@ -197,6 +197,9 @@ struct uwsgi_python {
 	PyObject *raw_callable;
 
 	struct uwsgi_string_list *sharedarea;
+
+	int call_osafterfork;
+	int pre_initialized;
 };
 
 
@@ -296,6 +299,8 @@ void uwsgi_python_exception_log(struct wsgi_request *);
 int uwsgi_python_send_body(struct wsgi_request *, PyObject *);
 
 int uwsgi_request_python_raw(struct wsgi_request *);
+
+void uwsgi_python_set_thread_name(int);
 
 #define py_current_wsgi_req() current_wsgi_req();\
 			if (!wsgi_req) {\

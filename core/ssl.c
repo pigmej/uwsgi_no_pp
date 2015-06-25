@@ -30,7 +30,18 @@ void uwsgi_ssl_info_cb(SSL const *ssl, int where, int ret) {
 }
 
 int uwsgi_ssl_verify_callback(int ok, X509_STORE_CTX * x509_store) {
-        return 1;
+        if (!ok && uwsgi.ssl_verbose) {
+                char buf[256];
+                X509 *err_cert;
+                int depth;
+                int err;
+                depth = X509_STORE_CTX_get_error_depth(x509_store);
+                err_cert = X509_STORE_CTX_get_current_cert(x509_store);
+                X509_NAME_oneline(X509_get_subject_name(err_cert), buf, 256);
+                err = X509_STORE_CTX_get_error(x509_store);
+                uwsgi_log("[uwsgi-ssl] client certificate verify error: num=%d:%s:depth=%d:%s\n", err, X509_verify_cert_error_string(err), depth, buf);
+        }
+        return ok;
 }
 
 int uwsgi_ssl_session_new_cb(SSL *ssl, SSL_SESSION *sess) {
@@ -210,6 +221,10 @@ SSL_CTX *uwsgi_ssl_new_server_context(char *name, char *crt, char *key, char *ci
         ssloptions |= SSL_OP_NO_COMPRESSION;
 #endif
 
+	if (!uwsgi.sslv3) {
+		ssloptions |= SSL_OP_NO_SSLv3;
+	}
+
 // release/reuse buffers as soon as possibile
 #ifdef SSL_MODE_RELEASE_BUFFERS
         SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
@@ -243,6 +258,7 @@ SSL_CTX *uwsgi_ssl_new_server_context(char *name, char *crt, char *key, char *ci
                 DH *dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
                 BIO_free(bio);
                 if (dh) {
+                        SSL_CTX_set_options(ctx, SSL_OP_SINGLE_DH_USE);
                         SSL_CTX_set_tmp_dh(ctx, dh);
                         DH_free(dh);
                 }
@@ -252,6 +268,7 @@ SSL_CTX *uwsgi_ssl_new_server_context(char *name, char *crt, char *key, char *ci
 #ifdef NID_X9_62_prime256v1
         EC_KEY *ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
         if (ecdh) {
+                SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
                 SSL_CTX_set_tmp_ecdh(ctx, ecdh);
                 EC_KEY_free(ecdh);
         }
@@ -394,6 +411,11 @@ SSL_CTX *uwsgi_ssl_new_server_context(char *name, char *crt, char *key, char *ci
 
         SSL_CTX_set_timeout(ctx, uwsgi.ssl_sessions_timeout);
 
+	struct uwsgi_string_list *usl = NULL;
+	uwsgi_foreach(usl, uwsgi.ssl_options) {
+		ssloptions |= atoi(usl->value);
+	}
+
         SSL_CTX_set_options(ctx, ssloptions);
 
 
@@ -492,6 +514,13 @@ clear:
 }
 
 char *uwsgi_sanitize_cert_filename(char *base, char *key, uint16_t keylen) {
+	// stop at the first slash if mountpoints are involved
+	if (uwsgi.subscription_mountpoints) {
+		char *slash = memchr(key, '/', keylen);
+		if (slash) {
+			keylen = slash - key;
+		}
+	}
         uint16_t i;
         char *filename = uwsgi_concat4n(base, strlen(base), "/", 1, key, keylen, ".pem\0", 5);
 

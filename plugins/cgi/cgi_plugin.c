@@ -480,7 +480,7 @@ static int uwsgi_cgi_request(struct wsgi_request *wsgi_req) {
 	char *script_name = NULL;
 
 	/* Standard CGI request */
-	if (!wsgi_req->uh->pktsize) {
+	if (!wsgi_req->len) {
 		uwsgi_log("Empty CGI request. skip.\n");
 		return -1;
 	}
@@ -533,9 +533,9 @@ static int uwsgi_cgi_request(struct wsgi_request *wsgi_req) {
 		memcpy(full_path, tmp_path, full_path_len+1);
 
 		if (uwsgi_starts_with(full_path, full_path_len, docroot, docroot_len)) {
+                	uwsgi_log("CGI security error: %s is not under %s\n", full_path, docroot);
 			if (need_free)
 				free(docroot);
-                	uwsgi_log("CGI security error: %s is not under %s\n", full_path, docroot);
                 	return -1;
         	}
 
@@ -731,7 +731,7 @@ clear2:
 
 		// now wait for process exit/death
 		// in async mode we need a trick...
-		if (uwsgi.async > 1) {
+		if (uwsgi.async > 0) {
 			pid_t diedpid = waitpid(cgi_pid, &waitpid_status, WNOHANG);
 			if (diedpid < 0) {
                                	uwsgi_error("waitpid()");

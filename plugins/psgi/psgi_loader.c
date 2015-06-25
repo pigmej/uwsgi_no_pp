@@ -11,8 +11,8 @@ XS(XS_input_seek) {
         dXSARGS;
 	struct wsgi_request *wsgi_req = current_wsgi_req();
 
-        psgi_check_args(1);
-	uwsgi_request_body_seek(wsgi_req, SvIV(ST(0)));
+        psgi_check_args(2);
+	uwsgi_request_body_seek(wsgi_req, SvIV(ST(1)));
 
         XSRETURN(0);
 }
@@ -25,11 +25,12 @@ XS(XS_error) {
         psgi_check_args(0);
 
 	if (uwsgi.threads > 1) {
-        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->error)[wsgi_req->async_id]);
+        	ST(0) = sv_bless(newRV_noinc(newSV(0)), ((HV **)wi->error)[wsgi_req->async_id]);
 	}
 	else {
-        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->error)[0]);
+        	ST(0) = sv_bless(newRV_noinc(newSV(0)), ((HV **)wi->error)[0]);
 	}
+        sv_2mortal(ST(0));
         XSRETURN(1);
 }
 
@@ -41,11 +42,12 @@ XS(XS_input) {
         psgi_check_args(0);
 
 	if (uwsgi.threads > 1) {
-        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->input)[wsgi_req->async_id]);
+        	ST(0) = sv_bless(newRV_noinc(newSV(0)), ((HV **)wi->input)[wsgi_req->async_id]);
 	}
 	else {
-        	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->input)[0]);
+        	ST(0) = sv_bless(newRV_noinc(newSV(0)), ((HV **)wi->input)[0]);
 	}
+        sv_2mortal(ST(0));
         XSRETURN(1);
 }
 
@@ -80,11 +82,12 @@ XS(XS_stream)
 
 		SvREFCNT_dec(response);
 		if (uwsgi.threads > 1) {
-                	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->stream)[wsgi_req->async_id]);
+                	ST(0) = sv_bless(newRV_noinc(newSV(0)), ((HV **)wi->stream)[wsgi_req->async_id]);
 		}
 		else {
-                	ST(0) = sv_bless(newRV(sv_newmortal()), ((HV **)wi->stream)[0]);
+                	ST(0) = sv_bless(newRV_noinc(newSV(0)), ((HV **)wi->stream)[0]);
 		}
+                sv_2mortal(ST(0));
                 XSRETURN(1);
 	}
 	else {
@@ -141,7 +144,7 @@ XS(XS_input_read) {
 			else {
 				long orig_offset = 0;
 				 // first of all get the new orig_len;   
-                                offset = abs(offset);
+                                offset = labs(offset);
                                 if (offset > (long) orig_len) {
                                         new_size = offset;
 					orig_offset = offset - orig_len;
@@ -271,6 +274,51 @@ nonworker:
 	newCONSTSUB(stash, "SPOOL_RETRY", newSViv(-1));
 	newCONSTSUB(stash, "SPOOL_IGNORE", newSViv(0));
 
+	HV *_opts = newHV();
+
+	int i;
+	for (i = 0; i < uwsgi.exported_opts_cnt; i++) {
+		if (hv_exists(_opts, uwsgi.exported_opts[i]->key, strlen(uwsgi.exported_opts[i]->key))) {
+			SV **value = hv_fetch(_opts, uwsgi.exported_opts[i]->key, strlen(uwsgi.exported_opts[i]->key), 0);
+			// last resort !!!
+			if (!value) {
+				uwsgi_log("[perl] WARNING !!! unable to build uwsgi::opt hash !!!\n");
+				goto end;
+			}
+			if (SvTYPE(SvRV(*value)) == SVt_PVAV) {
+				if (uwsgi.exported_opts[i]->value == NULL) {
+                                        av_push((AV *)SvRV(*value), newSViv(1));
+                                }
+                                else {
+                                        av_push((AV *)SvRV(*value), newSVpv(uwsgi.exported_opts[i]->value, 0));
+                                }
+			}
+			else {
+				AV *_opt_a = newAV();
+				av_push(_opt_a, SvREFCNT_inc(*value));
+				if (uwsgi.exported_opts[i]->value == NULL) {
+					av_push(_opt_a, newSViv(1));
+				}
+				else {
+					av_push(_opt_a, newSVpv(uwsgi.exported_opts[i]->value, 0));
+				}
+				(void ) hv_store(_opts, uwsgi.exported_opts[i]->key, strlen(uwsgi.exported_opts[i]->key), newRV_inc((SV *) _opt_a), 0);
+			}
+		}
+		else {
+			if (uwsgi.exported_opts[i]->value == NULL) {
+				(void )hv_store(_opts, uwsgi.exported_opts[i]->key, strlen(uwsgi.exported_opts[i]->key), newSViv(1), 0);
+			}
+			else {
+				(void)hv_store(_opts, uwsgi.exported_opts[i]->key, strlen(uwsgi.exported_opts[i]->key), newSVpv(uwsgi.exported_opts[i]->value, 0), 0);
+			}
+		}
+	}
+
+	newCONSTSUB(stash, "opt", newRV_inc((SV *) _opts));
+
+end:
+
         init_perl_embedded_module();
 
 }
@@ -337,11 +385,13 @@ int init_psgi_app(struct wsgi_request *wsgi_req, char *app, uint16_t app_len, Pe
 	if (!interpreters) goto clear2;
 
 	callables = uwsgi_calloc(sizeof(SV *) * uwsgi.threads);
-	uperl.tmp_streaming_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
-	uperl.tmp_input_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
-	uperl.tmp_error_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
-	uperl.tmp_stream_responder = uwsgi_calloc(sizeof(CV *) * uwsgi.threads);
-	uperl.tmp_psgix_logger = uwsgi_calloc(sizeof(CV *) * uwsgi.threads);
+	if (!uperl.early_interpreter) {
+		uperl.tmp_streaming_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
+		uperl.tmp_input_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
+		uperl.tmp_error_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
+		uperl.tmp_stream_responder = uwsgi_calloc(sizeof(CV *) * uwsgi.threads);
+		uperl.tmp_psgix_logger = uwsgi_calloc(sizeof(CV *) * uwsgi.threads);
+	}
 
 	for(i=0;i<uwsgi.threads;i++) {
 
@@ -369,7 +419,7 @@ int init_psgi_app(struct wsgi_request *wsgi_req, char *app, uint16_t app_len, Pe
 		// our xs_init hook, but we're *not* calling it with
 		// uperl.embedding as an argument so we won't execute
 		// BEGIN blocks in app_name twice.
-		{
+		if (!uperl.early_interpreter) {
 			char *perl_e_arg = uwsgi_concat2("#line 0 ", app_name);
 			char *perl_init_arg[] = { "", "-e", perl_e_arg };
 			if (perl_parse(interpreters[i], xs_init, 3, perl_init_arg, NULL)) {
@@ -392,7 +442,6 @@ int init_psgi_app(struct wsgi_request *wsgi_req, char *app, uint16_t app_len, Pe
 		perl_eval_pv("use IO::Handle;", 1);
 		perl_eval_pv("use IO::File;", 1);
 		perl_eval_pv("use IO::Socket;", 1);
-		perl_eval_pv("use Scalar::Util;", 1);
 
 		if (uperl.argv_items || uperl.argv_item) {
 			AV *uperl_argv = GvAV(PL_argvgv);
@@ -453,46 +502,19 @@ int init_psgi_app(struct wsgi_request *wsgi_req, char *app, uint16_t app_len, Pe
 		PERL_SET_CONTEXT(interpreters[0]);
 	}
 
+	// is it an early loading ?
+	if (!uwsgi.workers) {
+		uperl.early_psgi_app_name = app_name;
+		uperl.early_psgi_callable = callables;
+		return 0;
+	}
+
 	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
 		uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
 		goto clear;
 	}
 
-	int id = uwsgi_apps_cnt;
-	struct uwsgi_app *wi = NULL;
-
-	if (wsgi_req) {
-		// we need a copy of app_id
-		wi = uwsgi_add_app(id, psgi_plugin.modifier1, uwsgi_concat2n(wsgi_req->appid, wsgi_req->appid_len, "", 0), wsgi_req->appid_len, interpreters, callables);
-	}
-	else {
-		wi = uwsgi_add_app(id, psgi_plugin.modifier1, "", 0, interpreters, callables);
-	}
-
-	wi->started_at = now;
-	wi->startup_time = uwsgi_now() - now;
-
-        uwsgi_log("PSGI app %d (%s) loaded in %d seconds at %p (interpreter %p)\n", id, app_name, (int) wi->startup_time, callables[0], interpreters[0]);
-	free(app_name);
-
-	// copy global data to app-specific areas
-	wi->stream = uperl.tmp_streaming_stash;
-	wi->input = uperl.tmp_input_stash;
-	wi->error = uperl.tmp_error_stash;
-	wi->responder0 = uperl.tmp_stream_responder;
-	wi->responder1 = uperl.tmp_psgix_logger;
-
-	uwsgi_emulate_cow_for_apps(id);
-
-
-	// restore context if required
-	if (interpreters != uperl.main) {
-		PERL_SET_CONTEXT(uperl.main[0]);
-	}
-
-	uperl.loaded = 1;
-
-	return id;
+	return uwsgi_perl_add_app(wsgi_req, app_name, interpreters, callables, now);
 
 clear:
 	if (interpreters != uperl.main) {
@@ -509,6 +531,44 @@ clear2:
        	return -1; 
 }
 
+int uwsgi_perl_add_app(struct wsgi_request *wsgi_req, char *app_name, PerlInterpreter **interpreters, SV **callables, time_t now) {
+	int id = uwsgi_apps_cnt;
+        struct uwsgi_app *wi = NULL;
+
+        if (wsgi_req) {
+                // we need a copy of app_id
+                wi = uwsgi_add_app(id, psgi_plugin.modifier1, uwsgi_concat2n(wsgi_req->appid, wsgi_req->appid_len, "", 0), wsgi_req->appid_len, interpreters, callables);
+        }
+        else {
+                wi = uwsgi_add_app(id, psgi_plugin.modifier1, "", 0, interpreters, callables);
+        }
+
+        wi->started_at = now;
+        wi->startup_time = uwsgi_now() - now;
+
+        uwsgi_log("PSGI app %d (%s) loaded in %d seconds at %p (interpreter %p)\n", id, app_name, (int) wi->startup_time, callables[0], interpreters[0]);
+        free(app_name);
+
+        // copy global data to app-specific areas
+        wi->stream = uperl.tmp_streaming_stash;
+        wi->input = uperl.tmp_input_stash;
+        wi->error = uperl.tmp_error_stash;
+        wi->responder0 = uperl.tmp_stream_responder;
+        wi->responder1 = uperl.tmp_psgix_logger;
+
+        uwsgi_emulate_cow_for_apps(id);
+
+
+        // restore context if required
+        if (interpreters != uperl.main) {
+                PERL_SET_CONTEXT(uperl.main[0]);
+        }
+
+        uperl.loaded = 1;
+
+        return id;
+}
+
 void uwsgi_psgi_preinit_apps() {
 	if (uperl.exec) {
 		PERL_SET_CONTEXT(uperl.main[0]);
@@ -523,6 +583,10 @@ void uwsgi_psgi_preinit_apps() {
 }
 
 void uwsgi_psgi_app() {
+
+	if (uperl.early_psgi_callable) {
+		uwsgi_perl_add_app(NULL, uperl.early_psgi_app_name, uperl.main, uperl.early_psgi_callable, uwsgi_now());	
+	}
 
         if (uperl.psgi) {
 		//load app in the main interpreter list

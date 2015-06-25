@@ -26,6 +26,45 @@ static void uwsgi_opt_plshell(char *opt, char *value, void *foobar) {
         }
 }
 
+EXTERN_C void xs_init (pTHX);
+int uwsgi_perl_init(void);
+
+static void uwsgi_opt_early_perl(char *opt, char *value, void *foobar) {
+	// avoid duplicates
+	if (uperl.early_interpreter) return;
+	uwsgi_perl_init();
+	uperl.early_interpreter = uperl.main[0];
+
+	// HACK the following allocations ensure correct xs initialization
+	uperl.tmp_streaming_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
+        uperl.tmp_input_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
+        uperl.tmp_error_stash = uwsgi_calloc(sizeof(HV *) * uwsgi.threads);
+        uperl.tmp_stream_responder = uwsgi_calloc(sizeof(CV *) * uwsgi.threads);
+        uperl.tmp_psgix_logger = uwsgi_calloc(sizeof(CV *) * uwsgi.threads);
+
+	char *perl_e_arg = uwsgi_concat2("#line 0 ", value);
+        char *perl_init_arg[] = { "", "-e", perl_e_arg };
+        perl_parse(uperl.early_interpreter, xs_init, 3, perl_init_arg, NULL);
+	free(perl_e_arg);
+}
+
+static void uwsgi_opt_early_psgi(char *opt, char *value, void *foobar) {
+	uwsgi_perl_init();
+	init_psgi_app(NULL, value, strlen(value), uperl.main);
+	if (!uperl.early_psgi_callable) exit(1);
+}
+
+static void uwsgi_opt_early_exec(char *opt, char *value, void *foobar) {
+        uwsgi_perl_init();
+	if (!uperl.early_interpreter) {
+        	perl_parse(uperl.main[0], xs_init, 3, uperl.embedding, NULL);
+	}
+        SV *dollar_zero = get_sv("0", GV_ADD);
+        sv_setsv(dollar_zero, newSVpv(value, strlen(value)));
+        uwsgi_perl_exec(value);
+}
+
+
 struct uwsgi_option uwsgi_perl_options[] = {
 
         {"psgi", required_argument, 0, "load a psgi app", uwsgi_opt_set_str, &uperl.psgi, 0},
@@ -46,6 +85,9 @@ struct uwsgi_option uwsgi_perl_options[] = {
         {"plshell-oneshot", no_argument, 0, "run a perl interactive shell (one shot)", uwsgi_opt_plshell, NULL, 0},
 
         {"perl-no-plack", no_argument, 0, "force the use of do instead of Plack::Util::load_psgi", uwsgi_opt_true, &uperl.no_plack, 0},
+        {"early-perl", required_argument, 0, "initialize an early perl interpreter shared by all loaders", uwsgi_opt_early_perl, NULL, UWSGI_OPT_IMMEDIATE},
+        {"early-psgi", required_argument, 0, "load a psgi app soon after uWSGI initialization", uwsgi_opt_early_psgi, NULL, UWSGI_OPT_IMMEDIATE},
+        {"early-perl-exec", required_argument, 0, "load a perl script soon after uWSGI initialization", uwsgi_opt_early_exec, NULL, UWSGI_OPT_IMMEDIATE},
         {0, 0, 0, 0, 0, 0, 0},
 
 };
@@ -114,7 +156,7 @@ SV *uwsgi_perl_obj_new(char *class, size_t class_len) {
 
 	SPAGAIN;
 
-	newobj = POPs;	
+	newobj = SvREFCNT_inc(POPs);
 	PUTBACK;
 	FREETMPS;
 	LEAVE;
@@ -211,34 +253,6 @@ int uwsgi_perl_obj_can(SV *obj, char *method, size_t len) {
         return ret;
 
 }
-
-int uwsgi_perl_obj_isa(SV *obj, char *class) {
-
-	int ret = 0;
-
-        dSP;
-
-        ENTER;
-        SAVETMPS;
-        PUSHMARK(SP);
-        XPUSHs(obj);
-        PUTBACK;
-
-        call_pv( "Scalar::Util::reftype", G_SCALAR|G_EVAL);
-
-        SPAGAIN;
-        char *reftype = POPp;
-	if (reftype && !strcmp(reftype, class)) {
-		ret = 1;
-	}
-        PUTBACK;
-        FREETMPS;
-        LEAVE;
-
-        return ret;
-
-}
-
 
 SV *uwsgi_perl_obj_call(SV *obj, char *method) {
 
@@ -347,30 +361,15 @@ SV *build_psgi_env(struct wsgi_request *wsgi_req) {
         av_store( av, 1, newSViv(1));
         if (!hv_store(env, "psgi.version", 12, newRV_noinc((SV *)av ), 0)) goto clear;
 
-        if (uwsgi.numproc > 1) {
-                if (!hv_store(env, "psgi.multiprocess", 17, newSViv(1), 0)) goto clear;
-        }
-        else {
-                if (!hv_store(env, "psgi.multiprocess", 17, newSViv(0), 0)) goto clear;
-        }
+        // All the simple bools.
+        if (!hv_store(env, "psgi.multiprocess", 17, uwsgi.numproc > 1    ? &PL_sv_yes : &PL_sv_no, 0)) goto clear;
+        if (!hv_store(env, "psgi.multithread",  16, uwsgi.threads > 1    ? &PL_sv_yes : &PL_sv_no, 0)) goto clear;
+        if (!hv_store(env, "psgi.nonblocking",  16, uwsgi.async   > 0    ? &PL_sv_yes : &PL_sv_no, 0)) goto clear;
+        if (!hv_store(env, "psgix.harakiri",    14, uwsgi.master_process ? &PL_sv_yes : &PL_sv_no, 0)) goto clear;
 
-        if (uwsgi.threads > 1) {
-                if (!hv_store(env, "psgi.multithread", 16, newSViv(1), 0)) goto clear;
-        }
-        else {
-                if (!hv_store(env, "psgi.multithread", 16, newSViv(0), 0)) goto clear;
-        }
-
-        if (!hv_store(env, "psgi.run_once", 13, newSViv(0), 0)) goto clear;
-
-        if (uwsgi.async > 1) {
-                if (!hv_store(env, "psgi.nonblocking", 16, newSViv(1), 0)) goto clear;
-        }
-        else {
-                if (!hv_store(env, "psgi.nonblocking", 16, newSViv(0), 0)) goto clear;
-        }
-
-        if (!hv_store(env, "psgi.streaming", 14, newSViv(1), 0)) goto clear;
+        if (!hv_store(env, "psgi.run_once",  13, &PL_sv_no,  0)) goto clear;
+        if (!hv_store(env, "psgi.streaming", 14, &PL_sv_yes, 0)) goto clear;
+        if (!hv_store(env, "psgix.cleanup",  13, &PL_sv_yes, 0)) goto clear;
 
 	SV *us;
         // psgi.url_scheme, honour HTTPS var or UWSGI_SCHEME
@@ -404,11 +403,6 @@ SV *build_psgi_env(struct wsgi_request *wsgi_req) {
 		if (!hv_store(env, "psgix.logger", 12,newRV((SV*) ((SV **)wi->responder1)[0]) ,0)) goto clear;
 	}
 
-	if (uwsgi.master_process) {
-		if (!hv_store(env, "psgix.harakiri", 14, newSViv(1), 0)) goto clear;
-	}
-
-	if (!hv_store(env, "psgix.cleanup", 13, newSViv(1), 0)) goto clear;
 	// cleanup handlers array
 	av = newAV();
 	if (!hv_store(env, "psgix.cleanup.handlers", 22, newRV_noinc((SV *)av ), 0)) goto clear;
@@ -436,6 +430,10 @@ int uwsgi_perl_init(){
 
 	int argc;
 	int i;
+
+	if (uperl.main) {
+		goto already_initialized;
+	}
 
 	uperl.embedding[0] = "";
 	uperl.embedding[1] = "-e";
@@ -477,6 +475,7 @@ int uwsgi_perl_init(){
 
 	PERL_SET_CONTEXT(uperl.main[0]);
 
+already_initialized:
 #ifdef PERL_VERSION_STRING
 	uwsgi_log_initial("initialized Perl %s main interpreter at %p\n", PERL_VERSION_STRING, uperl.main[0]);
 #else
@@ -494,7 +493,7 @@ int uwsgi_perl_request(struct wsgi_request *wsgi_req) {
 	}
 
 	/* Standard PSGI request */
-	if (!wsgi_req->uh->pktsize) {
+	if (!wsgi_req->len) {
 		uwsgi_log("Empty PSGI request. skip.\n");
 		return -1;
 	}
@@ -584,7 +583,7 @@ int uwsgi_perl_request(struct wsgi_request *wsgi_req) {
 	}
 
 	while (psgi_response(wsgi_req, wsgi_req->async_result) != UWSGI_OK) {
-		if (uwsgi.async > 1) {
+		if (uwsgi.async > 0) {
 			FREETMPS;
 			LEAVE;
 			return UWSGI_AGAIN;
@@ -637,6 +636,19 @@ void uwsgi_perl_after_request(struct wsgi_request *wsgi_req) {
 	// before the environ is set up.
 	if (!wsgi_req->async_environ) return;
 
+	// we need to restore the context in case of multiple interpreters
+	struct uwsgi_app *wi = &uwsgi_apps[wsgi_req->app_id];
+	if (uwsgi.threads < 2) {
+                if (((PerlInterpreter **)wi->interpreter)[0] != uperl.main[0]) {
+                        PERL_SET_CONTEXT(((PerlInterpreter **)wi->interpreter)[0]);
+                }
+        }
+        else {
+                if (((PerlInterpreter **)wi->interpreter)[wsgi_req->async_id] != uperl.main[wsgi_req->async_id]) {
+                        PERL_SET_CONTEXT(((PerlInterpreter **)wi->interpreter)[wsgi_req->async_id]);
+                }
+        }
+
 	// dereference %env
 	SV *env = SvRV((SV *) wsgi_req->async_environ);
 
@@ -661,14 +673,20 @@ void uwsgi_perl_after_request(struct wsgi_request *wsgi_req) {
 		if (SvTRUE(*harakiri)) wsgi_req->async_plagued = 1;
 	}
 
+	// Free the $env hash
+	SvREFCNT_dec(wsgi_req->async_environ);
+
 	// async plagued could be defined in other areas...
 	if (wsgi_req->async_plagued) {
 		uwsgi_log("*** psgix.harakiri.commit requested ***\n");
-		goodbye_cruel_world();
-	}
+		// Before we call exit(0) we'll run the
+		// uwsgi_perl_atexit() hook which'll properly tear
+		// down the interpreter.
 
-	// clear the env
-	SvREFCNT_dec(wsgi_req->async_environ);
+		// mark the request as ended (otherwise the atexit hook will be skipped)
+		uwsgi.workers[uwsgi.mywid].cores[wsgi_req->async_id].in_request = 0;
+		goodbye_cruel_world("async plagued");
+	}
 
 	// now we can check for changed files
         if (uperl.auto_reload) {
@@ -677,6 +695,19 @@ void uwsgi_perl_after_request(struct wsgi_request *wsgi_req) {
                         uwsgi_perl_check_auto_reload();
                 }
         }
+
+	// restore main interpreter if needed
+        if (uwsgi.threads > 1) {
+                if (((PerlInterpreter **)wi->interpreter)[wsgi_req->async_id] != uperl.main[wsgi_req->async_id]) {
+                        PERL_SET_CONTEXT(uperl.main[wsgi_req->async_id]);
+                }
+        }
+        else {
+                if (((PerlInterpreter **)wi->interpreter)[0] != uperl.main[0]) {
+                        PERL_SET_CONTEXT(uperl.main[0]);
+                }
+        }
+
 
 }
 
@@ -803,24 +834,39 @@ void uwsgi_perl_run_hook(SV *hook) {
 }
 
 static void uwsgi_perl_atexit() {
+	int i;
+
 	if (uwsgi.mywid == 0) goto realstuff;
 
-        // if hijacked do not run atexit hooks
+        // if hijacked do not run atexit hooks -- TODO: explain why
+        // not.
         if (uwsgi.workers[uwsgi.mywid].hijacked)
-                return;
+                goto destroyperl;
 
-        // if busy do not run atexit hooks
+	// if busy do not run atexit hooks (as this part could be called in a signal handler
+	// while a subroutine is running)
         if (uwsgi_worker_is_busy(uwsgi.mywid))
                 return;
 
-        // managing atexit in async mode is a real pain...skip it for now
-        if (uwsgi.async > 1)
-                return;
 realstuff:
 
 	if (uperl.atexit) {
 		uwsgi_perl_run_hook(uperl.atexit);
 	}
+
+destroyperl:
+
+        // We must free our perl context(s) so any DESTROY hooks
+        // etc. will run.
+        for(i=0;i<uwsgi.threads;i++) {
+            PERL_SET_CONTEXT(uperl.main[i]);
+
+            // Destroy the PerlInterpreter, see "perldoc perlembed"
+            perl_destruct(uperl.main[i]);
+            perl_free(uperl.main[i]);
+        }
+        PERL_SYS_TERM();
+        free(uperl.main);
 }
 
 static uint64_t uwsgi_perl_rpc(void *func, uint8_t argc, char **argv, uint16_t argvs[], char **buffer) {
@@ -945,7 +991,15 @@ static int uwsgi_perl_spooler(char *filename, char *buf, uint16_t len, char *bod
 	return ret;
 }
 
+static int uwsgi_perl_hook_perl(char *arg) {
+	SV *ret = perl_eval_pv(arg, 0);
+	if (!ret) return -1;
+	return 0;
+}
 
+static void uwsgi_perl_register_features() {
+	uwsgi_register_hook("perl", uwsgi_perl_hook_perl);
+}
 
 struct uwsgi_plugin psgi_plugin = {
 
@@ -976,4 +1030,5 @@ struct uwsgi_plugin psgi_plugin = {
 	.magic = uwsgi_perl_magic,
 
 	.spooler = uwsgi_perl_spooler,
+	.on_load = uwsgi_perl_register_features,
 };

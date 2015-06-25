@@ -41,6 +41,7 @@ struct uwsgi_option http_options[] = {
 
 	{"http-raw-body", no_argument, 0, "blindly send HTTP body to backends (required for WebSockets and Icecast support in backends)", uwsgi_opt_true, &uhttp.raw_body, 0},
 	{"http-websockets", no_argument, 0, "automatically detect websockets connections and put the session in raw mode", uwsgi_opt_true, &uhttp.websockets, 0},
+	{"http-chunked-input", no_argument, 0, "automatically detect chunked input requests and put the session in raw mode", uwsgi_opt_true, &uhttp.chunked_input, 0},
 
 	{"http-use-code-string", required_argument, 0, "use code string as hostname->server mapper for the http router", uwsgi_opt_corerouter_cs, &uhttp, 0},
         {"http-use-socket", optional_argument, 0, "forward request to the specified uwsgi socket", uwsgi_opt_corerouter_use_socket, &uhttp, 0},
@@ -62,13 +63,139 @@ struct uwsgi_option http_options[] = {
 	{"http-server-name-as-http-host", required_argument, 0, "force SERVER_NAME to HTTP_HOST", uwsgi_opt_true, &uhttp.server_name_as_http_host, 0},
 	{"http-headers-timeout", required_argument, 0, "set internal http socket timeout for headers", uwsgi_opt_set_int, &uhttp.headers_timeout, 0},
 	{"http-connect-timeout", required_argument, 0, "set internal http socket timeout for backend connections", uwsgi_opt_set_int, &uhttp.connect_timeout, 0},
+
+	{"http-manage-source", no_argument, 0, "manage the SOURCE HTTP method placing the session in raw mode", uwsgi_opt_true, &uhttp.manage_source, 0},
+	{"http-enable-proxy-protocol", optional_argument, 0, "manage PROXY protocol requests", uwsgi_opt_true, &uhttp.enable_proxy_protocol, 0},
+
+	{"http-backend-http", no_argument, 0, "use plain http protocol instead of uwsgi for backend nodes", uwsgi_opt_true, &uhttp.proto_http, 0},
+
+	{"http-manage-rtsp", no_argument, 0, "manage RTSP sessions", uwsgi_opt_true, &uhttp.manage_rtsp, 0},
 	{0, 0, 0, 0, 0, 0, 0},
 };
+
+static int rebuild_key_for_mountpoint(struct http_session *hr, struct corerouter_peer *peer) {
+	if (hr->request_uri_len == 0) return -1;
+	if (hr->request_uri[0] != '/') return -1;
+	uint16_t uri_len = hr->request_uri_len -1;
+	// find QUERY_STRING (if any)
+	char *qs = memchr(hr->request_uri+1, '?', uri_len);
+	if (qs) {
+		uri_len = (qs - hr->request_uri) - 1;
+	}
+	// is it / ?
+	if (uri_len == 0) return 0;
+	// now find the second slash occurrence (if any)
+	char *second_slash = memchr(hr->request_uri+1, '/', uri_len);
+	char *new_key = NULL;
+	uint16_t new_key_len = 0;
+	if (second_slash) {
+		new_key = uwsgi_concat2n(peer->key, peer->key_len, hr->request_uri, second_slash - hr->request_uri);	
+		new_key_len = peer->key_len + (second_slash - hr->request_uri);
+	}
+	else {
+		new_key = uwsgi_concat2n(peer->key, peer->key_len, hr->request_uri, uri_len + 1);
+		new_key_len = peer->key_len + uri_len + 1;
+	}
+
+	if (new_key_len <= 0xff) {
+		memcpy(peer->key, new_key, new_key_len);
+		peer->key_len = new_key_len;
+	}
+	free(new_key);
+	return 0;
+}
 
 static void http_set_timeout(struct corerouter_peer *peer, int timeout) {
 	if (peer->current_timeout == timeout) return;
 	peer->current_timeout = timeout;
 	peer->timeout = corerouter_reset_timeout(peer->session->corerouter, peer);
+}
+
+static int http_header_dumb_check(struct http_session *hr, struct corerouter_peer *peer, char *hh, size_t hhlen) {
+	size_t i;
+        char *val = hh;
+        int status = 0;
+	uint16_t keylen = 0;
+	uint16_t vallen = 0;
+        for (i = 0; i < hhlen; i++) {
+                if (!status) {
+                        if (hh[i] == ':') {
+                                status = 1;
+                                keylen = i;
+                        }
+                }
+                else if (status == 1 && hh[i] != ' ') {
+                        status = 2;
+                        val += i;
+                        vallen+=1;
+                }
+                else if (status == 2) {
+                        vallen+=1;
+                }
+        }
+
+	if (!keylen) return -1;
+
+	if (hr->websockets) {
+                if (!uwsgi_strnicmp("UPGRADE", 7, hh, keylen)) {
+                        if (!uwsgi_strncmp(val, vallen, "websocket", 9)) {
+                                hr->websockets++;
+                        }
+			return 0;
+                }
+                else if (!uwsgi_strncmp("CONNECTION", 10, hh, keylen)) {
+                        if (!uwsgi_strnicmp(val, vallen, "Upgrade", 7)) {
+                                hr->websockets++;
+                        }
+			return 0;
+                }
+                else if (!uwsgi_strnicmp("SEC-WEBSOCKET-VERSION", 21, hh, keylen)) {
+                        hr->websockets++;
+			return 0;
+                }
+                else if (!uwsgi_strnicmp("SEC-WEBSOCKET-KEY", 17, hh, keylen)) {
+                        hr->websocket_key = val;
+                        hr->websocket_key_len = vallen;
+			return 0;
+                }
+        }
+
+
+        if (!uwsgi_strnicmp("CONTENT-LENGTH", 14, hh, keylen)) {
+                hr->content_length = uwsgi_str_num(val, vallen);
+        }
+
+        // in the future we could support chunked requests...
+        else if (!uwsgi_strnicmp("TRANSFER_ENCODING", 17, hh, keylen)) {
+                hr->session.can_keepalive = 0;
+		if (uhttp.chunked_input) {
+			if (!uwsgi_strnicmp(val, vallen, "chunked", 7)) {
+				hr->raw_body = 1;
+			} 
+		}
+        }
+
+        else if (!uwsgi_strnicmp("CONNECTION", 10, hh, keylen)) {
+                if (!uwsgi_strnicmp(val, vallen, "close", 5) || !uwsgi_strnicmp(val, vallen, "upgrade", 7)) {
+                        hr->session.can_keepalive = 0;
+                }
+        }
+        else if (peer->key == uwsgi.hostname && hr->raw_body && !uwsgi_strnicmp("ICE-URL", 7, hh, keylen)) {
+		if (vallen <= 0xff) {
+                	memcpy(peer->key, val, vallen);
+                	peer->key_len = vallen;
+		}
+        }
+
+#ifdef UWSGI_ZLIB
+        else if (uhttp.auto_gzip && !uwsgi_strnicmp("ACCEPT-ENCODING", 15, hh, keylen)) {
+                if ( uwsgi_contains_n(val, vallen, "gzip", 4) ) {
+                        hr->can_gzip = 1;
+                }
+        }
+#endif
+
+	return 0;
 }
 
 static char * http_header_to_cgi(char *hh, size_t hhlen, size_t *keylen, size_t *vallen, int *has_prefix) {
@@ -135,9 +262,14 @@ static int http_add_uwsgi_header(struct corerouter_peer *peer, char *hh, size_t 
 	}	
 
 	if (!uwsgi_strncmp("HOST", 4, hh, keylen)) {
-		peer->key = val;
-		peer->key_len = vallen;
-		if (uhttp.server_name_as_http_host && uwsgi_buffer_append_keyval(out, "SERVER_NAME", 11, peer->key, peer->key_len)) return -1;
+		if (vallen <= 0xff) {
+			memcpy(peer->key, val, vallen);
+			peer->key_len = vallen;
+			if (uhttp.server_name_as_http_host && uwsgi_buffer_append_keyval(out, "SERVER_NAME", 11, peer->key, peer->key_len)) return -1;
+		}
+		else {
+			return -1;
+		}
 	}
 
 	else if (!uwsgi_strncmp("CONTENT_LENGTH", 14, hh, keylen)) {
@@ -147,11 +279,22 @@ static int http_add_uwsgi_header(struct corerouter_peer *peer, char *hh, size_t 
 	// in the future we could support chunked requests...
 	else if (!uwsgi_strncmp("TRANSFER_ENCODING", 17, hh, keylen)) {
 		hr->session.can_keepalive = 0;
+		if (uhttp.chunked_input) {
+                        if (!uwsgi_strnicmp(val, vallen, "chunked", 7)) {
+                                hr->raw_body = 1;
+                        }
+                }
 	}
 
 	else if (!uwsgi_strncmp("CONNECTION", 10, hh, keylen)) {
-		if (!uwsgi_strnicmp(val, vallen, "close", 5)) {
+		if (!uwsgi_strnicmp(val, vallen, "close", 5) || !uwsgi_strnicmp(val, vallen, "upgrade", 7)) {
 			hr->session.can_keepalive = 0;
+		}
+	}
+	else if (peer->key == uwsgi.hostname && hr->raw_body && !uwsgi_strncmp("ICE_URL", 7, hh, keylen)) {
+		if (vallen <= 0xff) {
+                        memcpy(peer->key, val, vallen);
+                        peer->key_len = vallen;
 		}
 	}
 
@@ -180,14 +323,263 @@ done:
 	return 0;
 }
 
+static int http_headers_parse_first_round(struct corerouter_peer *peer) {
+        struct http_session *hr = (struct http_session *) peer->session;
+	char *ptr = peer->session->main_peer->in->buf;
+        char *watermark = ptr + hr->headers_size;
+        char *base = ptr;
+        char *proxy_dst = NULL;
+        char *proxy_dst_port = NULL;
+        uint16_t proxy_dst_len = 0;
+        uint16_t proxy_dst_port_len = 0;
 
-int http_headers_parse(struct corerouter_peer *peer) {
+	int skip = 0;
+
+	//struct uwsgi_buffer *out = peer->out;
+        int found = 0;
+
+        if (uwsgi.enable_proxy_protocol || uhttp.enable_proxy_protocol) {
+                ptr = proxy1_parse(ptr, watermark, &hr->proxy_src, &hr->proxy_src_len, &proxy_dst, &proxy_dst_len, &hr->proxy_src_port, &hr->proxy_src_port_len, &proxy_dst_port, &proxy_dst_port_len);
+		// how many bytes to skip ?
+		skip = ptr - base;
+                base = ptr;
+        }
+
+	// the following code is only a check for http compliance
+
+        // METHOD
+        while (ptr < watermark) {
+                if (*ptr == ' ') {
+                        ptr++;
+                        found = 1;
+                        break;
+                }
+                else if (*ptr == '\r' || *ptr == '\n') break;
+                ptr++;
+        }
+
+        // ensure we have a method
+        if (!found) return -1;
+
+	// REQUEST_URI / PATH_INFO / QUERY_STRING
+        base = ptr;
+        found = 0;
+        while (ptr < watermark) {
+                if (*ptr == ' ') {
+			// if we want to allow sub-keys, we need to parse the first part of the REQUEST_URI
+                        hr->request_uri = base;
+                        hr->request_uri_len = ptr - base;
+                        ptr++;
+                        found = 1;
+                        break;
+                }
+                ptr++;
+        }
+
+        // ensure we have a URI
+        if (!found) return -1;
+
+        // SERVER_PROTOCOL
+        base = ptr;
+        found = 0;
+        while (ptr < watermark) {
+                if (*ptr == '\r') {
+                        if (ptr + 1 >= watermark)
+                                return 0;
+                        if (*(ptr + 1) != '\n')
+                                return 0;
+                        ptr += 2;
+                        found = 1;
+                        break;
+                }
+                ptr++;
+        }
+
+        // ensure we have a protocol
+        if (!found) return -1;
+
+        memcpy(peer->key, uwsgi.hostname, uwsgi.hostname_len);
+        peer->key_len = uwsgi.hostname_len;
+
+        //HEADERS
+        base = ptr;
+        while (ptr < watermark) {
+                if (*ptr == '\r') {
+                        if (ptr + 1 >= watermark)
+                                break;
+                        if (*(ptr + 1) != '\n')
+                                break;
+                        // multiline header ?
+                        if (ptr + 2 < watermark) {
+                                if (*(ptr + 2) == ' ' || *(ptr + 2) == '\t') {
+                                        ptr += 2;
+                                        continue;
+                                }
+                        }
+
+                        if ((ptr - base) > 6 && !uwsgi_strnicmp("HOST: ", 6, base, 6)) {
+				if ((ptr - base) - 6 <= 0xff) {
+					peer->key_len = (ptr - base) - 6;
+					memcpy(peer->key, base + 6, peer->key_len);
+				}
+                        }
+
+                        // last line, do not waste time
+                        if (ptr - base == 0) break;
+                        ptr++;
+                        base = ptr + 1;
+                }
+                ptr++;
+        }
+
+	return skip;
+}
+
+static int http_headers_parse_dumb(struct corerouter_peer *peer, int skip) {
+	struct http_session *hr = (struct http_session *) peer->session;
+	char *ptr = peer->session->main_peer->in->buf;
+        char *watermark = ptr + hr->headers_size;
+        char *base = ptr + skip;
+
+	// leave space for X-Forwarded-For and X-Forwarded-Proto: https
+	peer->out = uwsgi_buffer_new(hr->headers_size + 256);
+        // force this buffer to be destroyed as soon as possibile
+        peer->out_need_free = 1;
+        peer->out->limit = UMAX16;
+        peer->out_pos = 0;
+
+        //struct uwsgi_buffer *out = peer->out;
+        int found = 0;
+
+	// the following code is only a check for http compliance
+
+	// METHOD
+	while (ptr < watermark) {
+                if (*ptr == ' ') {
+                        // on SOURCE METHOD, force raw body
+                        if (uhttp.manage_source && !uwsgi_strncmp(base, ptr - base, "SOURCE", 6)) {
+                                hr->raw_body = 1;
+                        }
+                        ptr++;
+                        found = 1;
+                        break;
+                }
+                else if (*ptr == '\r' || *ptr == '\n') break;
+                ptr++;
+        }
+
+        // ensure we have a method
+        if (!found) return -1;
+
+	// REQUEST_URI / PATH_INFO / QUERY_STRING
+        base = ptr;
+        found = 0;
+        while (ptr < watermark) {
+                if (*ptr == ' ') {
+                        ptr++;
+                        found = 1;
+                        break;
+                }
+                ptr++;
+        }
+
+        // ensure we have a URI
+        if (!found) return -1;
+
+	// SERVER_PROTOCOL
+        base = ptr;
+        found = 0;
+        while (ptr < watermark) {
+                if (*ptr == '\r') {
+                        if (ptr + 1 >= watermark)
+                                return 0;
+                        if (*(ptr + 1) != '\n')
+                                return 0;
+                        if (uhttp.keepalive && !uwsgi_strncmp("HTTP/1.1", 8, base, ptr-base)) {
+                                hr->session.can_keepalive = 1;
+                        }
+			if (uhttp.manage_rtsp && !uwsgi_strncmp("RTSP/1.0", 8, base, ptr-base)) {
+				hr->raw_body = 1;
+				hr->is_rtsp = 1;
+			}
+                        ptr += 2;
+                        found = 1;
+                        break;
+                }
+                ptr++;
+        }
+
+        // ensure we have a protocol
+        if (!found) return -1;
+
+	//HEADERS
+        base = ptr;
+        while (ptr < watermark) {
+                if (*ptr == '\r') {
+                        if (ptr + 1 >= watermark)
+                                break;
+                        if (*(ptr + 1) != '\n')
+                                break;
+                        // multiline header ?
+                        if (ptr + 2 < watermark) {
+                                if (*(ptr + 2) == ' ' || *(ptr + 2) == '\t') {
+                                        ptr += 2;
+                                        continue;
+                                }
+                        }
+
+                        // this is an hack with dumb/wrong/useless error checking
+                        if (uhttp.manage_expect) {
+                                if (!uwsgi_strncmp("Expect: 100-continue", 20, base, ptr - base)) {
+                                        hr->send_expect_100 = 1;
+                                }
+                        }
+                        // last line, do not waste time
+                        if (ptr - base == 0) break;
+			if (http_header_dumb_check(hr, peer, base, ptr - base)) return -1;
+                        ptr++;
+                        base = ptr + 1;
+                }
+                ptr++;
+        }
+
+	struct uwsgi_buffer *out = peer->out;
+	if (uwsgi_buffer_append(out, peer->session->main_peer->in->buf, hr->headers_size-1)) return -1;
+
+	// X-Forwarded-For
+        if (uwsgi_buffer_append(out, "X-Forwarded-For: ", 17)) return -1;
+        if (hr->proxy_src) {
+		if (uwsgi_buffer_append(out, hr->proxy_src, hr->proxy_src_len)) return -1;
+        }
+        else {
+                if (uwsgi_buffer_append(out, peer->session->client_address, strlen(peer->session->client_address))) return -1;
+	}
+	if (uwsgi_buffer_append(out, "\r\n", 2)) return -1;
+
+#ifdef UWSGI_SSL
+	if (hr->stud_prefix_pos > 0 || hr->session.ugs->mode == UWSGI_HTTP_SSL) {
+		if (uwsgi_buffer_append(out, "X-Forwarded-Proto: https\r\n", 26)) return -1;
+	}
+#endif
+
+	if (uwsgi_buffer_append(out, "\r\n", 2)) return -1;
+
+#ifdef UWSGI_SSL
+	if (hr->session.ugs->mode == UWSGI_HTTP_FORCE_SSL) {
+                hr->force_https = 1;
+        }
+#endif
+	
+	return 0;
+}
+
+int http_headers_parse(struct corerouter_peer *peer, int skip) {
 
 	struct http_session *hr = (struct http_session *) peer->session;
 
 	char *ptr = peer->session->main_peer->in->buf;
 	char *watermark = ptr + hr->headers_size;
-	char *base = ptr;
+	char *base = ptr + skip;
 	char *query_string = NULL;
 
 	peer->out = uwsgi_buffer_new(uwsgi.page_size);
@@ -205,6 +597,10 @@ int http_headers_parse(struct corerouter_peer *peer) {
 	while (ptr < watermark) {
 		if (*ptr == ' ') {
 			if (uwsgi_buffer_append_keyval(out, "REQUEST_METHOD", 14, base, ptr - base)) return -1;
+			// on SOURCE METHOD, force raw body
+			if (uhttp.manage_source && !uwsgi_strncmp(base, ptr - base, "SOURCE", 6)) {
+				hr->raw_body = 1;
+			}
 			ptr++;
 			found = 1;
 			break;
@@ -242,8 +638,6 @@ int http_headers_parse(struct corerouter_peer *peer) {
 			query_string = ptr + 1;
 		}
 		else if (*ptr == ' ') {
-			hr->request_uri = base;
-			hr->request_uri_len = ptr - base;
 			if (uwsgi_buffer_append_keyval(out, "REQUEST_URI", 11, base, ptr - base)) return -1;
 			if (!query_string) {
 				// PATH_INFO must be url-decoded !!!
@@ -292,6 +686,10 @@ int http_headers_parse(struct corerouter_peer *peer) {
 			if (uhttp.keepalive && !uwsgi_strncmp("HTTP/1.1", 8, base, ptr-base)) {
 				hr->session.can_keepalive = 1;
 			}
+			if (uhttp.manage_rtsp && !uwsgi_strncmp("RTSP/1.0", 8, base, ptr-base)) {
+				hr->raw_body = 1;
+				hr->is_rtsp = 1;
+			}
 			ptr += 2;
 			found = 1;
 			break;
@@ -309,8 +707,8 @@ int http_headers_parse(struct corerouter_peer *peer) {
 
 	// SERVER_NAME
 	if (!uhttp.server_name_as_http_host && uwsgi_buffer_append_keyval(out, "SERVER_NAME", 11, uwsgi.hostname, uwsgi.hostname_len)) return -1;
-	peer->key = uwsgi.hostname;
-	peer->key_len = uwsgi.hostname_len;
+	memcpy(peer->key, uwsgi.hostname, uwsgi.hostname_len);
+        peer->key_len = uwsgi.hostname_len;
 
 	// SERVER_PORT
 	if (uwsgi_buffer_append_keyval(out, "SERVER_PORT", 11, hr->port, hr->port_len)) return -1;
@@ -324,12 +722,21 @@ int http_headers_parse(struct corerouter_peer *peer) {
 	}
 
 #ifdef UWSGI_SSL
-	if (hr_https_add_vars(hr, out)) return -1;
+	if (hr_https_add_vars(hr, peer, out)) return -1;
 #endif
 
 	// REMOTE_ADDR
-	if (uwsgi_buffer_append_keyval(out, "REMOTE_ADDR", 11, peer->session->client_address, strlen(peer->session->client_address))) return -1;
-	if (uwsgi_buffer_append_keyval(out, "REMOTE_PORT", 11, peer->session->client_port, strlen(peer->session->client_port))) return -1;
+        if (hr->proxy_src) {
+		if (uwsgi_buffer_append_keyval(out, "REMOTE_ADDR", 11, hr->proxy_src, hr->proxy_src_len)) return -1;
+		if (hr->proxy_src_port) {
+			if (uwsgi_buffer_append_keyval(out, "REMOTE_PORT", 11, hr->proxy_src_port, hr->proxy_src_port_len)) return -1;
+		}
+	}
+	else
+	{
+		if (uwsgi_buffer_append_keyval(out, "REMOTE_ADDR", 11, peer->session->client_address, strlen(peer->session->client_address))) return -1;
+		if (uwsgi_buffer_append_keyval(out, "REMOTE_PORT", 11, peer->session->client_port, strlen(peer->session->client_port))) return -1;
+	}
 
 	//HEADERS
 	base = ptr;
@@ -410,6 +817,19 @@ int http_headers_parse(struct corerouter_peer *peer) {
 			if (uwsgi_buffer_append_keyval(out, hv->value, equal - hv->value, equal + 1, strlen(equal + 1))) return -1;
 		}
 		hv = hv->next;
+	}
+
+	if (hr->is_rtsp) {
+		if (uwsgi_starts_with("rtsp://", 7, hr->path_info, hr->path_info_len)) {
+			char *slash = memchr(hr->path_info + 7, '/', hr->path_info_len - 7);
+			if (!slash) return -1;
+			if (slash - (hr->path_info + 7) <= 0xff) {
+				peer->key_len = slash - (hr->path_info + 7);
+				memcpy(peer->key, hr->path_info + 7, peer->key_len);
+				// override PATH_INFO
+				if (uwsgi_buffer_append_keyval(out, "PATH_INFO", 9, slash, hr->path_info_len - (7 + peer->key_len))) return -1;
+			}
+		}
 	}
 
 	return 0;
@@ -755,8 +1175,8 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 			// default hook
 			new_peer->last_hook_read = hr_instance_read;
 		
-			// parse HTTP request
-			if (http_headers_parse(new_peer)) return -1;
+			int skip = http_headers_parse_first_round(new_peer);
+			if (skip < 0) return -1;
 
 			// check for a valid hostname
 			if (new_peer->key_len == 0) return -1;
@@ -767,6 +1187,9 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 				break;
 			}
 #endif
+			if (uwsgi.subscription_mountpoints) {
+				if (rebuild_key_for_mountpoint(hr, new_peer)) return -1;
+			}
 			// find an instance using the key
                 	if (ucr->mapper(ucr, new_peer))
                         	return -1;
@@ -775,13 +1198,25 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
                 	if (new_peer->instance_address_len == 0)
                         	return -1;
 
-			uint16_t pktsize = new_peer->out->pos-4;
-        		// fix modifiers
-        		new_peer->out->buf[0] = new_peer->session->main_peer->modifier1;
-        		new_peer->out->buf[3] = new_peer->session->main_peer->modifier2;
-        		// fix pktsize
-        		new_peer->out->buf[1] = (uint8_t) (pktsize & 0xff);
-        		new_peer->out->buf[2] = (uint8_t) ((pktsize >> 8) & 0xff);
+			// parse HTTP request
+			if (new_peer->proto != 'h' && !uhttp.proto_http) {
+				if (http_headers_parse(new_peer, skip)) return -1;
+				// fix modifiers
+                        	if (uhttp.modifier1)
+                                	new_peer->modifier1 = uhttp.modifier1;
+                        	if (uhttp.modifier2)
+                                	new_peer->modifier2 = uhttp.modifier2;
+				 uint16_t pktsize = new_peer->out->pos-4;
+                        	// fix modifiers
+                        	new_peer->out->buf[0] = new_peer->modifier1;
+                        	new_peer->out->buf[3] = new_peer->modifier2;
+                        	// fix pktsize
+                        	new_peer->out->buf[1] = (uint8_t) (pktsize & 0xff);
+                        	new_peer->out->buf[2] = (uint8_t) ((pktsize >> 8) & 0xff);
+			}
+			else {
+				if (http_headers_parse_dumb(new_peer, skip)) return -1;
+			}
 
 			if (hr->remains > 0) {
 				if (hr->content_length < hr->remains) { 
@@ -796,6 +1231,19 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 				if (uwsgi_buffer_append(new_peer->out, main_peer->in->buf + hr->headers_size + 1, hr->remains)) return -1;
 			}
 
+			if (new_peer->modifier1 == 123) {
+				// reset modifier1 to 0
+				new_peer->out->buf[0] = 0;
+				hr->raw_body = 1;
+			}
+
+			if (hr->websockets > 2 && hr->websocket_key_len > 0) {
+				hr->raw_body = 1;
+			}
+
+			// on raw body, ensure keepalive is disabled
+			if (hr->raw_body) hr->session.can_keepalive = 0;
+
 			if (hr->session.can_keepalive && hr->content_length == 0) {
 				main_peer->disabled = 1;
 				// stop reading from the client
@@ -807,9 +1255,7 @@ ssize_t http_parse(struct corerouter_peer *main_peer) {
 				break;
         		}
 
-			if (hr->websockets > 2 && hr->websocket_key_len > 0) {
-				hr->raw_body = 1;
-			}
+
 			new_peer->can_retry = 1;
 			// reset main timeout
 			http_set_timeout(main_peer, uhttp.cr.socket_timeout);
@@ -915,9 +1361,6 @@ int http_alloc_session(struct uwsgi_corerouter *ucr, struct uwsgi_gateway_socket
 	// set the retry hook
         cs->retry = hr_retry;
 	struct http_session *hr = (struct http_session *) cs;
-	// set the modifier1
-	cs->main_peer->modifier1 = uhttp.modifier1;
-	cs->main_peer->modifier2 = uhttp.modifier2;
 	// default hook
 	cs->main_peer->last_hook_read = hr_read;
 
@@ -931,6 +1374,7 @@ int http_alloc_session(struct uwsgi_corerouter *ucr, struct uwsgi_gateway_socket
 	if (uhttp.websockets) {
 		hr->websockets = 1;	
 	}
+
 	hr->func_write = hr_write;
 
 	// be sure buffer does not grow over 64k

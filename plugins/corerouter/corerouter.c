@@ -65,6 +65,7 @@ void uwsgi_cr_peer_reset(struct corerouter_peer *peer) {
 		free(peer->tmp_socket_name);
 		peer->tmp_socket_name = NULL;
 	}
+
 	cr_del_timeout(peer->session->corerouter, peer);
 	
 	if (peer->fd != -1) {
@@ -73,6 +74,12 @@ void uwsgi_cr_peer_reset(struct corerouter_peer *peer) {
 		peer->fd = -1;
 		peer->hook_read = NULL;
 		peer->hook_write = NULL;
+	}
+
+	if (peer->is_buffering) {
+		if (peer->buffering_fd != -1) {
+			close(peer->buffering_fd);
+		}
 	}
 
 	peer->failed = 0;
@@ -84,7 +91,14 @@ void uwsgi_cr_peer_reset(struct corerouter_peer *peer) {
 }
 
 // destroy a peer
-void uwsgi_cr_peer_del(struct corerouter_peer *peer) {
+int uwsgi_cr_peer_del(struct corerouter_peer *peer) {
+	// first of all check if we need to run a flush procedure
+	if (peer->flush && !peer->is_flushing) {
+        	peer->is_flushing = 1;
+		// on success, suspend the execution
+		if (peer->flush(peer) >= 0) return -1;
+        }
+
 	struct corerouter_peer *prev = peer->prev;
 	struct corerouter_peer *next = peer->next;
 
@@ -110,7 +124,9 @@ void uwsgi_cr_peer_del(struct corerouter_peer *peer) {
 	if (peer->out && peer->out_need_free) {
 		uwsgi_buffer_destroy(peer->out);
 	}
+
 	free(peer);
+	return 0;
 }
 
 void uwsgi_opt_corerouter(char *opt, char *value, void *cr) {
@@ -291,6 +307,16 @@ void corerouter_manage_subscription(char *key, uint16_t keylen, char *val, uint1
 		usr->notify = val;
                 usr->notify_len = vallen;
 	}
+	else if (!uwsgi_strncmp("algo", 4, key, keylen)) {
+                usr->algo = uwsgi_subscription_algo_get(val, vallen);
+        }
+	else if (!uwsgi_strncmp("backup", 6, key, keylen)) {
+		usr->backup_level = uwsgi_str_num(val, vallen);
+        }
+	else if (!uwsgi_strncmp("proto", 5, key, keylen)) {
+                usr->proto = val;
+                usr->proto_len = vallen;
+        }
 }
 
 void corerouter_close_peer(struct uwsgi_corerouter *ucr, struct corerouter_peer *peer) {
@@ -310,7 +336,6 @@ void corerouter_close_peer(struct uwsgi_corerouter *ucr, struct corerouter_peer 
         }
 
 	if (peer->failed) {
-		
 		if (peer->soopt) {
                         if (!ucr->quiet)
                                 uwsgi_log("[uwsgi-%s] unable to connect() to node \"%.*s\" (%d retries): %s\n", ucr->short_name, (int) peer->instance_address_len, peer->instance_address, peer->retries, strerror(peer->soopt));
@@ -384,7 +409,7 @@ void corerouter_close_peer(struct uwsgi_corerouter *ucr, struct corerouter_peer 
 	}
 
 end:
-	uwsgi_cr_peer_del(peer);
+	if (uwsgi_cr_peer_del(peer) < 0) return;
 
 	if (peer == cs->main_peer) {
 		cs->main_peer = NULL;
@@ -402,7 +427,7 @@ void corerouter_close_session(struct uwsgi_corerouter *ucr, struct corerouter_se
 
 	struct corerouter_peer *main_peer = cr_session->main_peer;
 	if (main_peer) {
-		uwsgi_cr_peer_del(main_peer);
+		if (uwsgi_cr_peer_del(main_peer) < 0) return;
 	}
 
 	// free peers
@@ -414,7 +439,7 @@ void corerouter_close_session(struct uwsgi_corerouter *ucr, struct corerouter_se
 		if (ucr->subscriptions && tmp_peer->un && tmp_peer->un->len) {
 			tmp_peer->un->reference--;
 		}
-		uwsgi_cr_peer_del(tmp_peer);
+		if (uwsgi_cr_peer_del(tmp_peer) < 0) return; 
 	}
 
 	// could be used to free additional resources
@@ -1052,6 +1077,7 @@ void corerouter_send_stats(struct uwsgi_corerouter *ucr) {
 #ifdef UWSGI_SSL
 				if (uwsgi_stats_keylong_comma(us, "sni_enabled", (unsigned long long) s_slot->sni_enabled)) goto end0;
 #endif
+				if (uwsgi_stats_keyval_comma(us, "algo", uwsgi_subscription_algo_name(s_slot->algo))) goto end0;
 
 				if (uwsgi_stats_key(us , "nodes")) goto end0;
 				if (uwsgi_stats_list_open(us)) goto end0;
@@ -1075,6 +1101,8 @@ void corerouter_send_stats(struct uwsgi_corerouter *ucr) {
 					if (uwsgi_stats_keylong_comma(us, "cores", (unsigned long long) s_node->cores)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "load", (unsigned long long) s_node->load)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "weight", (unsigned long long) s_node->weight)) goto end0;
+					if (uwsgi_stats_keylong_comma(us, "backup", (unsigned long long) s_node->backup_level)) goto end0;
+					if (uwsgi_stats_keyvaln_comma(us, "proto", &s_node->proto, 1)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "wrr", (unsigned long long) s_node->wrr)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "ref", (unsigned long long) s_node->reference)) goto end0;
 					if (uwsgi_stats_keylong_comma(us, "failcnt", (unsigned long long) s_node->failcnt)) goto end0;

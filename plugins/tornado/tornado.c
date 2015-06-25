@@ -235,7 +235,7 @@ PyObject *py_uwsgi_tornado_accept(PyObject *self, PyObject *args) {
 
         // enter harakiri mode
         if (uwsgi.harakiri_options.workers > 0) {
-                set_harakiri(uwsgi.harakiri_options.workers);
+                set_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
         }
 
 	uwsgi.async_proto_fd_table[wsgi_req->fd] = wsgi_req;
@@ -326,6 +326,11 @@ static void tornado_loop() {
 		uwsgi_log("!!! Running tornado with a socket-timeout lower than 30 seconds is not recommended, tune it with --socket-timeout !!!\n");
 	}
 
+	if (!uwsgi.async_waiting_fd_table)
+                uwsgi.async_waiting_fd_table = uwsgi_calloc(sizeof(struct wsgi_request *) * uwsgi.max_fd);
+        if (!uwsgi.async_proto_fd_table)
+                uwsgi.async_proto_fd_table = uwsgi_calloc(sizeof(struct wsgi_request *) * uwsgi.max_fd);
+
 	// get the GIL
 	UWSGI_GET_GIL
 
@@ -337,7 +342,7 @@ static void tornado_loop() {
 
 	uwsgi.schedule_fix = uwsgi_tornado_schedule_fix;
 
-	if (uwsgi.async < 2) {
+	if (uwsgi.async < 1) {
 		uwsgi_log("the tornado loop engine requires async mode (--async <n>)\n");
 		exit(1);
 	}

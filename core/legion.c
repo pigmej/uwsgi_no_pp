@@ -277,14 +277,12 @@ static void legions_check_nodes_step2() {
 			memcpy(best_uuid, node->uuid, 36);
 		}
 		// go on if i am not an arbiter
-		else if (ul->valor > 0) {
-			// no potential Lord is available, i will propose myself
-			// but only if i am not suspended...
-			if (uwsgi_now() > ul->suspended_til) {
-				best_valor = ul->valor;
-				memcpy(best_uuid, ul->uuid, 36);
-				i_am_the_best = 1;
-			}
+		// no potential Lord is available, i will propose myself
+		// but only if i am not suspended...
+		else if (ul->valor > 0 && uwsgi_now() > ul->suspended_til) {
+			best_valor = ul->valor;
+			memcpy(best_uuid, ul->uuid, 36);
+			i_am_the_best = 1;
 		}
 		else {
 			// empty lord
@@ -572,7 +570,7 @@ static void *legion_loop(void *foobar) {
 
 			d_len += d2_len;
 
-			if (d_len != uh->pktsize) {
+			if (d_len != uh->_pktsize) {
 				uwsgi_log("[uwsgi-legion] invalid packet size\n");
 				continue;
 			}
@@ -1212,6 +1210,9 @@ next:
 		legion = legion->next;
 	}
 
+	// this must be called only by the master !!!
+	if (!uwsgi.workers) return;
+	if (uwsgi.workers[0].pid != getpid()) return;
 	uwsgi_legion_announce_death();
 }
 

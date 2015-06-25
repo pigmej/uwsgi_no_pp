@@ -1,7 +1,7 @@
+NAME = 'emperor_zeromq'
 
-NAME='emperor_zeromq'
 CFLAGS = []
 LDFLAGS = []
-LIBS = []
+LIBS = ['-lzmq']
 
 GCC_LIST = ['emperor_zeromq']

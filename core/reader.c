@@ -123,7 +123,7 @@ static int consume_body_for_readline(struct wsgi_request *wsgi_req) {
 
 	// allocate more memory if needed
 	if (wsgi_req->post_readline_size - wsgi_req->post_readline_watermark == 0) {
-		memcpy(wsgi_req->post_readline_buf, wsgi_req->post_readline_buf + wsgi_req->post_readline_pos, wsgi_req->post_readline_watermark - wsgi_req->post_readline_pos);
+		memmove(wsgi_req->post_readline_buf, wsgi_req->post_readline_buf + wsgi_req->post_readline_pos, wsgi_req->post_readline_watermark - wsgi_req->post_readline_pos);
 		wsgi_req->post_readline_watermark -= wsgi_req->post_readline_pos;
 		wsgi_req->post_readline_pos = 0;
 		// still something to use ?
@@ -477,7 +477,7 @@ int uwsgi_postbuffer_do_in_mem(struct wsgi_request *wsgi_req) {
 
         while (remains > 0) {
                 if (uwsgi.harakiri_options.workers > 0) {
-                        inc_harakiri(uwsgi.harakiri_options.workers);
+                        inc_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
                 }
 
                 ssize_t rlen = wsgi_req->socket->proto_read_body(wsgi_req, ptr, remains);
@@ -551,7 +551,7 @@ int uwsgi_postbuffer_do_in_disk(struct wsgi_request *wsgi_req) {
 
                 // during post buffering we need to constantly reset the harakiri
                 if (uwsgi.harakiri_options.workers > 0) {
-                        inc_harakiri(uwsgi.harakiri_options.workers);
+                        inc_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
                 }
 
                 // we use the already available post buffering buffer to read chunks....

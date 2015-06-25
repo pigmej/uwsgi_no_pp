@@ -45,7 +45,7 @@ int uwsgi_master_manage_events(int interesting_fd) {
 	// emperor event ?
 	if (uwsgi.has_emperor) {
 		if (uwsgi.emperor_fd_proxy > -1 && interesting_fd == uwsgi.emperor_fd_proxy) {
-			uwsgi_master_manage_emperor_proxy();	
+			uwsgi_master_manage_emperor_proxy(uwsgi.emperor_fd_proxy, uwsgi.emperor_fd, uwsgi.emperor_fd_config, -1);	
 			return 0;
 		}
 
@@ -118,16 +118,9 @@ int uwsgi_master_manage_events(int interesting_fd) {
                                 else {
                                         uwsgi_log_verbose("*** fd %d ready !!! ***\n", interesting_fd);
                                 }
-				if (uwsgi.die_on_term) {
-                                	uwsgi_block_signal(SIGQUIT);
-                                	reap_them_all(0);
-                                	uwsgi_unblock_signal(SIGQUIT);
-				}
-				else {
-                                	uwsgi_block_signal(SIGTERM);
-                                	reap_them_all(0);
-                                	uwsgi_unblock_signal(SIGTERM);
-				}
+                                uwsgi_block_signal(SIGQUIT);
+                                reap_them_all(0);
+                                uwsgi_unblock_signal(SIGQUIT);
                                 if (usl->custom2 > 8) free(tmp);
                                 return 0;
                         }

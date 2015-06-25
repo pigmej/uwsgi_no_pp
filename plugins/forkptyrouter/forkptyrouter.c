@@ -16,14 +16,14 @@
 
 extern struct uwsgi_server uwsgi;
 
-#if defined(__linux__) || defined(__GNU_kFreeBSD__)
+#if defined(__linux__) || defined(__GNU_kFreeBSD__) || defined(__HURD__)
 #include <pty.h>
 #elif defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <util.h>
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
 #include <libutil.h>
 #endif
-#ifndef __FreeBSD__
+#if !defined(__FreeBSD__) && !defined(__DragonFly__)
 #include <utmp.h>
 #endif
 
@@ -134,7 +134,7 @@ static ssize_t fpty_parse_uwsgi(struct corerouter_peer *peer) {
 	for(;;) {
 	if (peer->in->pos < 4) return 0;
 	struct uwsgi_header *uh = (struct uwsgi_header *) peer->in->buf;
-	uint16_t pktsize = uh->pktsize;
+	uint16_t pktsize = uh->_pktsize;
 	switch(uh->modifier2) {
 		case 0:
 			// stdin

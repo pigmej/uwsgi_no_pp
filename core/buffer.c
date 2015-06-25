@@ -128,7 +128,16 @@ int uwsgi_buffer_append_json(struct uwsgi_buffer *ub, char *buf, size_t len) {
 	// need to escape \ and "
 	size_t i;
 	for(i=0;i<len;i++) {
-		if (buf[i] == '"') {
+		if (buf[i] == '\t') {
+			if (uwsgi_buffer_append(ub, "\\t", 2)) return -1;
+		}
+		else if (buf[i] == '\n') {
+			if (uwsgi_buffer_append(ub, "\\n", 2)) return -1;
+		}
+		else if (buf[i] == '\r') {
+			if (uwsgi_buffer_append(ub, "\\r", 2)) return -1;
+		}
+		else if (buf[i] == '"') {
 			if (uwsgi_buffer_append(ub, "\\\"", 2)) return -1;
 		}
 		else if (buf[i] == '\\') {
@@ -139,6 +148,32 @@ int uwsgi_buffer_append_json(struct uwsgi_buffer *ub, char *buf, size_t len) {
 		}
 	}
 	return 0;
+}
+
+int uwsgi_buffer_append_xml(struct uwsgi_buffer *ub, char *buf, size_t len) {
+        // need to escape \ and "
+        size_t i;
+        for(i=0;i<len;i++) {
+                if (buf[i] == '"') {
+                        if (uwsgi_buffer_append(ub, "&quot;", 6)) return -1;
+                }
+                else if (buf[i] == '\'') {
+                        if (uwsgi_buffer_append(ub, "&apos;", 6)) return -1;
+                }
+                else if (buf[i] == '<') {
+                        if (uwsgi_buffer_append(ub, "&lt;", 4)) return -1;
+                }
+                else if (buf[i] == '>') {
+                        if (uwsgi_buffer_append(ub, "&gt;", 4)) return -1;
+                }
+                else if (buf[i] == '&') {
+                        if (uwsgi_buffer_append(ub, "&amp;", 5)) return -1;
+                }
+                else {
+                        if (uwsgi_buffer_append(ub, buf+i, 1)) return -1;
+                }
+        }
+        return 0;
 }
 
 int uwsgi_buffer_u16le(struct uwsgi_buffer *ub, uint16_t num) {
@@ -408,4 +443,11 @@ void uwsgi_buffer_map(struct uwsgi_buffer *ub, char *buf, size_t len) {
 	ub->buf = buf;
 	ub->pos = len;
 	ub->len = len;
+}
+
+int uwsgi_buffer_httpdate(struct uwsgi_buffer *ub, time_t t) {
+	char http_last_modified[49];
+        int size = uwsgi_http_date(t, http_last_modified);
+	if (size <= 0) return -1;
+	return uwsgi_buffer_append(ub, http_last_modified, size);
 }

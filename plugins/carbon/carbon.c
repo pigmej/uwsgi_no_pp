@@ -71,7 +71,9 @@ static void carbon_post_init() {
 		u_server->errors = 0;
 
 		char *p, *ctx = NULL;
-		uwsgi_foreach_token(usl->value, ":", p, ctx) {
+		// make a copy to not clobber argv
+		char *tmp = uwsgi_str(usl->value);
+		uwsgi_foreach_token(tmp, ":", p, ctx) {
 			if (!u_server->hostname) {
 				u_server->hostname = uwsgi_str(p);
 			}
@@ -81,6 +83,7 @@ static void carbon_post_init() {
 			else
 				break;
 		}
+		free(tmp);
 		if (!u_server->hostname || !u_server->port) {
 			uwsgi_log("[carbon] invalid carbon server address (%s)\n", usl->value);
 			usl = usl->next;
@@ -196,7 +199,7 @@ static int carbon_push_stats(int retry_cycle, time_t now) {
 	for (i = 0; i < uwsgi.numproc; i++) {
 		u_carbon.current_busyness_values[i] = uwsgi.workers[i+1].running_time - u_carbon.last_busyness_values[i];
 		u_carbon.last_busyness_values[i] = uwsgi.workers[i+1].running_time;
-		u_carbon.was_busy[i-1] += uwsgi_worker_is_busy(i+1);
+		u_carbon.was_busy[i] += uwsgi_worker_is_busy(i+1);
 	}
 
 	needs_retry = 0;
@@ -380,6 +383,11 @@ metrics_loop:
 				uwsgi_rlock(uwsgi.metrics_lock);
 				wok = carbon_write(fd, "%s%s.%s.%.*s %llu %llu\n", u_carbon.root_node, u_carbon.hostname, u_carbon.id, um->name_len, um->name, (unsigned long long) *um->value, (unsigned long long) now);
 				uwsgi_rwunlock(uwsgi.metrics_lock);
+				if (um->reset_after_push){
+					uwsgi_wlock(uwsgi.metrics_lock);
+					*um->value = um->initial_value;
+					uwsgi_rwunlock(uwsgi.metrics_lock);
+				}
 				if (!wok) goto clear;
 				um = um->next;
 			}

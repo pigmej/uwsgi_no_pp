@@ -516,7 +516,7 @@ static void uwsgi_mono_init_apps() {
 static int uwsgi_mono_request(struct wsgi_request *wsgi_req) {
 
 	/* Standard ASP.NET request */
-        if (!wsgi_req->uh->pktsize) {
+        if (!wsgi_req->len) {
                 uwsgi_log("Empty Mono/ASP.NET request. skip.\n");
                 return -1;
         }
@@ -543,7 +543,7 @@ static int uwsgi_mono_request(struct wsgi_request *wsgi_req) {
 
         wsgi_req->app_id = uwsgi_get_app_id(NULL, key, key_len, mono_plugin.modifier1);
         // if it is -1, try to load a dynamic app
-        if (wsgi_req->app_id == -1) {
+        if (wsgi_req->app_id == -1 && key_len > 0) {
         	if (uwsgi.threads > 1) {
                 	pthread_mutex_lock(&umono.lock_loader);
                 }
@@ -562,10 +562,15 @@ static int uwsgi_mono_request(struct wsgi_request *wsgi_req) {
 
 
         if (wsgi_req->app_id == -1) {
-        	uwsgi_500(wsgi_req);
-                uwsgi_log("--- unable to find Mono/ASP.NET application ---\n");
-                // nothing to clear/free
-                return UWSGI_OK;
+		if (!uwsgi.no_default_app && uwsgi.default_app > -1 && uwsgi_apps[uwsgi.default_app].modifier1 == mono_plugin.modifier1) {
+               		wsgi_req->app_id = uwsgi.default_app;
+                }
+		else {
+        		uwsgi_500(wsgi_req);
+                	uwsgi_log("--- unable to find Mono/ASP.NET application ---\n");
+                	// nothing to clear/free
+                	return UWSGI_OK;
+		}
         }
 
         struct uwsgi_app *app = &uwsgi_apps[wsgi_req->app_id];

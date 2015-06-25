@@ -90,7 +90,7 @@ char *uwsgi_simple_file_read(char *filename) {
 	}
 
 	if (fstat(fd, &sb)) {
-		uwsgi_error("fstat()");
+		uwsgi_error("uwsgi_simple_file_read()/fstat()");
 		close(fd);
 		goto end;
 	}
@@ -99,7 +99,7 @@ char *uwsgi_simple_file_read(char *filename) {
 
 	len = read(fd, buffer, sb.st_size);
 	if (len != sb.st_size) {
-		uwsgi_error("read()");
+		uwsgi_error("uwsgi_simple_file_read()/read()");
 		free(buffer);
 		close(fd);
 		goto end;
@@ -112,7 +112,7 @@ char *uwsgi_simple_file_read(char *filename) {
 	buffer[sb.st_size] = 0;
 	return buffer;
 end:
-	return (char *) "";
+	return NULL;
 
 }
 
@@ -277,7 +277,7 @@ static char *uwsgi_scheme_emperor(char *url, size_t *size, int add_zero) {
 		remains-=rlen;
 	}
 
-	remains = uh.pktsize;
+	remains = uh._pktsize;
 	if (!remains) {
 		uwsgi_log("[uwsgi-vassal] invalid config from %s\n", url);
 		exit(1);
@@ -300,7 +300,7 @@ static char *uwsgi_scheme_emperor(char *url, size_t *size, int add_zero) {
                 remains-=rlen;
 	}
 
-	*size = uh.pktsize + add_zero;
+	*size = uh._pktsize + add_zero;
 	return buffer;
 }
 
@@ -340,6 +340,10 @@ static char *uwsgi_scheme_data(char *url, size_t *size, int add_zero) {
 		}
 		if (datasize == 0) {
 			uwsgi_log("0 size binary data !!!\n");
+			exit(1);
+		}
+		if (datasize > SIZE_MAX) {
+			uwsgi_log("size binary data bigger than SIZE_MAX !!!\n");
 			exit(1);
 		}
 		fo = lseek(fd, -(datasize + 8), SEEK_CUR);
@@ -388,6 +392,26 @@ static char *uwsgi_scheme_call(char *url, size_t *size, int add_zero) {
         char *buffer = uwsgi_malloc(*size);
         memset(buffer, 0, *size);
         memcpy(buffer, s, strlen(s));
+
+        return buffer;
+}
+
+static char *uwsgi_scheme_callint(char *url, size_t *size, int add_zero) {
+        int (*func)(void) = dlsym(RTLD_DEFAULT, url);
+        if (!func) {
+                uwsgi_log("unable to find symbol %s\n", url);
+                exit(1);
+        }
+
+	char *s = uwsgi_num2str(func());
+        *size = strlen(s);
+        if (add_zero) {
+                *size += 1;
+        }
+        char *buffer = uwsgi_malloc(*size);
+        memset(buffer, 0, *size);
+        memcpy(buffer, s, strlen(s));
+	free(s);
 
         return buffer;
 }
@@ -1043,7 +1067,7 @@ readok:
         }
 
 	struct uwsgi_header *uh = (struct uwsgi_header *) buf;
-	uint16_t pktsize = uh->pktsize;
+	uint16_t pktsize = uh->_pktsize;
 	if (modifier1)
 		*modifier1 = uh->modifier1;
 	if (modifier2)
@@ -1249,6 +1273,7 @@ void uwsgi_setup_schemes() {
 	uwsgi_register_scheme("fd", uwsgi_scheme_fd);	
 	uwsgi_register_scheme("exec", uwsgi_scheme_exec);	
 	uwsgi_register_scheme("call", uwsgi_scheme_call);	
+	uwsgi_register_scheme("callint", uwsgi_scheme_callint);	
 }
 
 struct uwsgi_string_list *uwsgi_check_scheme(char *file) {
@@ -1479,5 +1504,131 @@ clear:
 #else
         return -1;
 #endif
+}
+
+ssize_t uwsgi_recv_cred_and_fds(int fd, char *buf, size_t buf_len, pid_t *pid, uid_t *uid, gid_t *gid, int *fds, int *fds_count) {
+#if defined(SCM_CREDENTIALS) && defined(SCM_RIGHTS)
+        ssize_t ret = -1;
+
+	size_t msg_len = CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(sizeof(int) * (*fds_count));
+
+	// allocate space for credentials and file descriptors
+        void *msg_control = uwsgi_calloc(msg_len);
+
+	// read into buf
+        struct iovec iov;
+        iov.iov_base = buf;
+        iov.iov_len = buf_len;
+
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+
+        msg.msg_name = NULL;
+        msg.msg_namelen = 0;
+
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+	// set cmsg
+        msg.msg_control = msg_control;
+        msg.msg_controllen = msg_len;
+
+        ssize_t len = recvmsg(fd, &msg, 0);
+        if (len <= 0) {
+                uwsgi_error("uwsgi_recv_cred_and_fds()/recvmsg()");
+                goto clear;
+        }
+
+	// reset the number of fds
+	*fds_count = 0;
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+	while(cmsg) {
+        	if (cmsg->cmsg_level != SOL_SOCKET) goto next;
+		if (cmsg->cmsg_type == SCM_RIGHTS) {
+			size_t fds_len = cmsg->cmsg_len - ((char *) CMSG_DATA(cmsg) - (char *) cmsg);			
+			memcpy(fds, CMSG_DATA(cmsg), fds_len);
+			*fds_count = fds_len/sizeof(int);
+		}
+		else if (cmsg->cmsg_type == SCM_CREDENTIALS) {
+        		struct ucred *u = (struct ucred *) CMSG_DATA(cmsg);
+        		*pid = u->pid;
+        		*uid = u->uid;
+        		*gid = u->gid;
+		}
+next:
+		cmsg=CMSG_NXTHDR(&msg,cmsg);
+        }
+
+        ret = len;
+
+clear:
+        free(msg_control);
+        return ret;
+#else
+        return -1;
+#endif
+}
+
+
+int uwsgi_send_fds_and_body(int fd, int *fds, int fds_count, char *body, size_t len) {
+
+	int ret = -1;
+
+        struct msghdr msg;
+        void *msg_control = uwsgi_malloc(CMSG_SPACE(sizeof(int) * fds_count));
+        struct iovec iov;
+        struct cmsghdr *cmsg;
+
+        iov.iov_base = body;
+        iov.iov_len = len;
+
+        msg.msg_name = NULL;
+        msg.msg_namelen = 0;
+
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        msg.msg_flags = 0;
+        msg.msg_control = msg_control;
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * fds_count);
+
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * fds_count);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+
+        unsigned char *fd_ptr = CMSG_DATA(cmsg);
+
+        memcpy(fd_ptr, fds, sizeof(int) * fds_count);
+
+        ssize_t rlen = sendmsg(fd, &msg, 0);
+	if (rlen <= 0) {
+                uwsgi_error("uwsgi_send_fds_and_body()/sendmsg()");
+		goto end;	
+        }
+	else {
+		size_t remains = len - rlen;
+		while(remains > 0) {
+			char *buf = body + rlen;
+			ssize_t wlen = write(fd, buf, remains);
+			if (wlen == 0) goto end;
+			if (wlen < 0) {
+				if (uwsgi_is_again()) {
+					// wait for write
+					continue;
+				}
+				uwsgi_error("uwsgi_send_fds_and_body()/write()");
+				goto end;
+			}
+			rlen += wlen;
+			remains -= wlen;
+		}
+	}
+	ret = 0;
+
+end:
+        free(msg_control);
+	return ret;	
 }
 

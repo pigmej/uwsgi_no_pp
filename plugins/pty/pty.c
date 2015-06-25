@@ -1,12 +1,12 @@
 #include <uwsgi.h>
-#if defined(__linux__) || defined(__GNU_kFreeBSD__)
+#if defined(__linux__) || defined(__GNU_kFreeBSD__) || defined(__HURD__)
 #include <pty.h>
 #elif defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <util.h>
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
 #include <libutil.h>
 #endif
-#ifndef __FreeBSD__
+#if !defined(__FreeBSD__) && !defined(__DragonFly__)
 #include <utmp.h>
 #endif
 
@@ -331,7 +331,7 @@ static int uwsgi_pty_client() {
 			if (upty.uremote) {
 				struct uwsgi_header uh;
 				uh.modifier1 = 0;
-				uh.pktsize = rlen;
+				uh._pktsize = rlen;
 				uh.modifier2 = 0;
 				if (write(upty.server_fd, &uh, 4) != 4) break;
 			}

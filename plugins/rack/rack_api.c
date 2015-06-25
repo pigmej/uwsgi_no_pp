@@ -110,7 +110,8 @@ static VALUE rack_uwsgi_warning(VALUE *class, VALUE rbmessage) {
 
 static VALUE rack_uwsgi_user_harakiri(VALUE *class, VALUE sec) {
         Check_Type(sec, T_FIXNUM);
-	set_user_harakiri(NUM2INT(sec));
+	struct wsgi_request *wsgi_req = current_wsgi_req();
+	set_user_harakiri(wsgi_req, NUM2INT(sec));
         return Qnil;
 }
 
@@ -765,10 +766,10 @@ static VALUE uwsgi_ruby_signal_wait(int argc, VALUE *argv, VALUE *class) {
         }
 
         if (wait_for_specific_signal) {
-                received_signal = uwsgi_signal_wait(uwsgi_signal);
+                received_signal = uwsgi_signal_wait(wsgi_req, uwsgi_signal);
         }
         else {
-                received_signal = uwsgi_signal_wait(-1);
+                received_signal = uwsgi_signal_wait(wsgi_req, -1);
         }
 
 	if (received_signal < 0) {
@@ -969,7 +970,6 @@ static int rack_uwsgi_build_spool(VALUE rbkey, VALUE rbval, VALUE argv) {
 
 static VALUE rack_uwsgi_send_spool(VALUE *class, VALUE args) {
 
-        struct wsgi_request *wsgi_req = current_wsgi_req();
         char *body = NULL;
         size_t body_len= 0;
 
@@ -991,7 +991,7 @@ static VALUE rack_uwsgi_send_spool(VALUE *class, VALUE args) {
 
 	rb_hash_foreach(args, rack_uwsgi_build_spool, (VALUE) ub); 
 
-        char *filename = uwsgi_spool_request(wsgi_req, ub->buf, ub->pos, body, body_len);
+        char *filename = uwsgi_spool_request(NULL, ub->buf, ub->pos, body, body_len);
 
 	uwsgi_buffer_destroy(ub);
 

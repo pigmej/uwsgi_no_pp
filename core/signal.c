@@ -2,7 +2,7 @@
 
 extern struct uwsgi_server uwsgi;
 
-int uwsgi_signal_handler(uint8_t sig) {
+int uwsgi_signal_handler(struct wsgi_request *wsgi_req, uint8_t sig) {
 
 	struct uwsgi_signal_entry *use = NULL;
 
@@ -41,12 +41,12 @@ int uwsgi_signal_handler(uint8_t sig) {
 
 	// set harakiri here (if required and if i am a worker)
 
-	if (uwsgi.mywid > 0) {
+	if (uwsgi.mywid > 0 && wsgi_req) {
 		uwsgi.workers[uwsgi.mywid].sig = 1;
 		uwsgi.workers[uwsgi.mywid].signum = sig;
 		uwsgi.workers[uwsgi.mywid].signals++;
 		if (uwsgi.harakiri_options.workers > 0) {
-			set_harakiri(uwsgi.harakiri_options.workers);
+			set_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
 		}
 	}
 	else if (uwsgi.muleid > 0) {
@@ -65,10 +65,10 @@ int uwsgi_signal_handler(uint8_t sig) {
 
 	int ret = uwsgi.p[use->modifier1]->signal_handler(sig, use->handler);
 
-	if (uwsgi.mywid > 0) {
+	if (uwsgi.mywid > 0 && wsgi_req) {
 		uwsgi.workers[uwsgi.mywid].sig = 0;
-		if (uwsgi.workers[uwsgi.mywid].harakiri > 0) {
-			set_harakiri(0);
+		if (uwsgi.workers[uwsgi.mywid].cores[wsgi_req->async_id].harakiri > 0) {
+			set_harakiri(wsgi_req, 0);
 		}
 	}
 	else if (uwsgi.muleid > 0) {
@@ -266,7 +266,7 @@ int uwsgi_remote_signal_send(char *addr, uint8_t sig) {
 	struct uwsgi_header uh;
 
 	uh.modifier1 = 110;
-	uh.pktsize = 0;
+	uh._pktsize = 0;
 	uh.modifier2 = sig;
 
         int fd = uwsgi_connect(addr, 0, 1);
@@ -331,6 +331,16 @@ void uwsgi_route_signal(uint8_t sig) {
 			}
 		}
 	}
+	// send to al lactive workers
+	else if (!strcmp(use->receiver, "active-workers")) {
+                for (i = 1; i <= uwsgi.numproc; i++) {
+			if (uwsgi.workers[i].pid > 0 && !uwsgi.workers[i].cheaped && !uwsgi.workers[i].suspended) {
+                        	if (uwsgi_signal_send(uwsgi.workers[i].signal_pipe[0], sig)) {
+                                	uwsgi_log("could not deliver signal %d to worker %d\n", sig, i);
+                        	}
+			}
+                }
+        }
 	// route to specific worker
 	else if (!strncmp(use->receiver, "worker", 6)) {
 		i = atoi(use->receiver + 6);
@@ -405,7 +415,7 @@ void uwsgi_route_signal(uint8_t sig) {
 
 }
 
-int uwsgi_signal_wait(int signum) {
+int uwsgi_signal_wait(struct wsgi_request *wsgi_req, int signum) {
 
 	int wait_for_specific_signal = 0;
 	uint8_t uwsgi_signal = 0;
@@ -430,7 +440,7 @@ cycle:
 				uwsgi_error("read()");
 			}
 			else {
-				(void) uwsgi_signal_handler(uwsgi_signal);
+				(void) uwsgi_signal_handler(wsgi_req, uwsgi_signal);
 				if (wait_for_specific_signal) {
 					if (signum != uwsgi_signal)
 						goto cycle;
@@ -443,7 +453,7 @@ cycle:
 				uwsgi_error("read()");
 			}
 			else {
-				(void) uwsgi_signal_handler(uwsgi_signal);
+				(void) uwsgi_signal_handler(wsgi_req, uwsgi_signal);
 				if (wait_for_specific_signal) {
 					if (signum != uwsgi_signal)
 						goto cycle;
@@ -457,7 +467,7 @@ cycle:
 	return received_signal;
 }
 
-void uwsgi_receive_signal(int fd, char *name, int id) {
+void uwsgi_receive_signal(struct wsgi_request *wsgi_req, int fd, char *name, int id) {
 
 	uint8_t uwsgi_signal;
 
@@ -474,7 +484,7 @@ void uwsgi_receive_signal(int fd, char *name, int id) {
 #ifdef UWSGI_DEBUG
 		uwsgi_log_verbose("master sent signal %d to %s %d\n", uwsgi_signal, name, id);
 #endif
-		if (uwsgi_signal_handler(uwsgi_signal)) {
+		if (uwsgi_signal_handler(wsgi_req, uwsgi_signal)) {
 			uwsgi_log_verbose("error managing signal %d on %s %d\n", uwsgi_signal, name, id);
 		}
 	}
@@ -483,7 +493,7 @@ void uwsgi_receive_signal(int fd, char *name, int id) {
 
 destroy:
 	// better to kill the whole worker...
-	uwsgi_log_verbose("uWSGI %s %d screams: UAAAAAAH my master disconnected: i will kill myself !!!\n", name, id);
+	uwsgi_log_verbose("uWSGI %s %d screams: UAAAAAAH my master disconnected: I will kill myself!!!\n", name, id);
 	end_me(0);
 
 }

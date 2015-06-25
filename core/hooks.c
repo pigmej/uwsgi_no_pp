@@ -91,6 +91,14 @@ static int uwsgi_hook_exec(char *arg) {
 	return ret;
 }
 
+static int uwsgi_hook_safeexec(char *arg) {
+        int ret = uwsgi_run_command_and_wait(NULL, arg);
+        if (ret != 0) {
+                uwsgi_log("command \"%s\" exited with non-zero code: %d\n", arg, ret);
+        }
+        return 0;
+}
+
 static int uwsgi_hook_exit(char *arg) {
 	int exit_code = 0;
 	if (strlen(arg) > 1) {
@@ -233,17 +241,26 @@ static int uwsgi_hook_writen(char *arg) {
 
 static int uwsgi_hook_appendn(char *arg) {
         char *space = strchr(arg, ' ');
-        if (!space) {
-                uwsgi_log("invalid hook appendn syntax, must be: <file> <string>\n");
-                return -1;
-        }
-        *space = 0;
+	if (space)
+        	*space = 0;
         int fd = open(arg, O_WRONLY|O_CREAT|O_APPEND, 0666);
         if (fd < 0) {
                 uwsgi_error_open(arg);
-                *space = ' ';
+		if (space)
+                	*space = ' ';
                 return -1;
         }
+	if (!space) {
+		// simple newline
+		if (write(fd, "\n", 1) != 1) {
+                	uwsgi_error("uwsgi_hook_appendn()/write()");
+			close(fd);
+			return -1;
+		}
+		close(fd);
+		return 0;
+	}
+
         *space = ' ';
         size_t l = strlen(space+1);
         char *buf = uwsgi_malloc(l + 1);
@@ -540,6 +557,22 @@ static int uwsgi_hook_retryrpc(char *arg) {
 	return 0;
 }
 
+static int uwsgi_hook_wait_for_fs(char *arg) {
+	return uwsgi_wait_for_fs(arg, 0);
+}
+
+static int uwsgi_hook_wait_for_file(char *arg) {
+	return uwsgi_wait_for_fs(arg, 1);
+}
+
+static int uwsgi_hook_wait_for_dir(char *arg) {
+	return uwsgi_wait_for_fs(arg, 2);
+}
+
+static int uwsgi_hook_wait_for_socket(char *arg) {
+	return uwsgi_wait_for_socket(arg);
+}
+
 void uwsgi_register_base_hooks() {
 	uwsgi_register_hook("cd", uwsgi_hook_chdir);
 	uwsgi_register_hook("chdir", uwsgi_hook_chdir);
@@ -553,6 +586,7 @@ void uwsgi_register_base_hooks() {
 	uwsgi_register_hook("sticky", uwsgi_hook_sticky);
 
 	uwsgi_register_hook("exec", uwsgi_hook_exec);
+	uwsgi_register_hook("safeexec", uwsgi_hook_safeexec);
 
 	uwsgi_register_hook("create", uwsgi_hook_creat);
 	uwsgi_register_hook("creat", uwsgi_hook_creat);
@@ -580,61 +614,185 @@ void uwsgi_register_base_hooks() {
 	uwsgi_register_hook("rpc", uwsgi_hook_rpc);
 	uwsgi_register_hook("retryrpc", uwsgi_hook_retryrpc);
 
+	uwsgi_register_hook("wait_for_fs", uwsgi_hook_wait_for_fs);
+	uwsgi_register_hook("wait_for_file", uwsgi_hook_wait_for_file);
+	uwsgi_register_hook("wait_for_dir", uwsgi_hook_wait_for_dir);
+
+	uwsgi_register_hook("wait_for_socket", uwsgi_hook_wait_for_socket);
+
 	// for testing
 	uwsgi_register_hook("exit", uwsgi_hook_exit);
 	uwsgi_register_hook("print", uwsgi_hook_print);
 	uwsgi_register_hook("log", uwsgi_hook_print);
 }
 
+int uwsgi_hooks_run_and_return(struct uwsgi_string_list *l, char *phase, char *context, int fatal) {
+	int final_ret = 0;
+	struct uwsgi_string_list *usl = NULL;
+	if (context) {
+		if (setenv("UWSGI_HOOK_CONTEXT", context, 1)) {
+			uwsgi_error("uwsgi_hooks_run_and_return()/setenv()");
+			return -1;
+		}
+	}
+        uwsgi_foreach(usl, l) {
+                char *colon = strchr(usl->value, ':');
+                if (!colon) {
+                        uwsgi_log("invalid hook syntax, must be hook:args\n");
+                        exit(1);
+                }
+                *colon = 0;
+                int private = 0;
+                char *action = usl->value;
+                // private hook ?
+                if (action[0] == '!') {
+                        action++;
+                        private = 1;
+                }
+                struct uwsgi_hook *uh = uwsgi_hook_by_name(action);
+                if (!uh) {
+                        uwsgi_log("hook action not found: %s\n", action);
+                        exit(1);
+                }
+                *colon = ':';
+
+                if (private) {
+                        uwsgi_log("running --- PRIVATE HOOK --- (%s)...\n", phase);
+                }
+                else {
+                        uwsgi_log("running \"%s\" (%s)...\n", usl->value, phase);
+                }
+
+                int ret = uh->func(colon+1);
+		if (ret != 0) {
+			if (fatal) {
+				if (context) {
+					unsetenv("UWSGI_HOOK_CONTEXT");
+				}
+				return ret;
+			}
+			final_ret = ret;
+		}
+        }
+
+	if (context) {
+		unsetenv("UWSGI_HOOK_CONTEXT");
+	}
+
+	return final_ret;
+}
+
 void uwsgi_hooks_run(struct uwsgi_string_list *l, char *phase, int fatal) {
+	int ret = uwsgi_hooks_run_and_return(l, phase, NULL, fatal);
+	if (fatal && ret != 0) {
+		uwsgi_log_verbose("FATAL hook failed, destroying instance\n");
+		if (uwsgi.master_process) {
+			if (uwsgi.workers) {
+				if (uwsgi.workers[0].pid == getpid()) {
+					kill_them_all(0);
+					return;
+				}
+				else {
+                                       	if (kill(uwsgi.workers[0].pid, SIGINT)) {
+						uwsgi_error("uwsgi_hooks_run()/kill()");
+						exit(1);
+					}
+					return;
+                               	}
+			}
+		}
+		exit(1);
+	}
+}
+
+#if defined(__linux__) && !defined(OBSOLETE_LINUX_KERNEL)
+/*
+this is a special hook, allowing the Emperor to enter a vassal
+namespace and call hooks in its namespace context.
+*/
+void uwsgi_hooks_setns_run(struct uwsgi_string_list *l, pid_t pid, uid_t uid, gid_t gid) {
+	int (*u_setns) (int, int) = (int (*)(int, int)) dlsym(RTLD_DEFAULT, "setns");
+        if (!u_setns) {
+                uwsgi_log("your system misses setns() syscall !!!\n");
+		return;
+        }
+
 	struct uwsgi_string_list *usl = NULL;
 	uwsgi_foreach(usl, l) {
-		char *colon = strchr(usl->value, ':');
-		if (!colon) {
-			uwsgi_log("invalid hook syntax, must be hook:args\n");
-			exit(1);
+		// fist of all fork() the current process
+		pid_t new_pid = fork();
+		if (new_pid > 0) {
+			// wait for its death
+			int status;
+			if (waitpid(new_pid, &status, 0) < 0) {
+				uwsgi_error("uwsgi_hooks_setns_run()/waitpid()");
+			}
 		}
-		*colon = 0;
-		int private = 0;
-		char *action = usl->value;
-		// private hook ?
-		if (action[0] == '!') {
-			action++;
-			private = 1;
-		}
-		struct uwsgi_hook *uh = uwsgi_hook_by_name(action);
-		if (!uh) {
-			uwsgi_log("hook action not found: %s\n", action);
-			exit(1);
-		}
-		*colon = ':';
+		else if (new_pid == 0) {
+			// from now on, freeing memory is useless
+			// now split args to know which namespaces to join
+			char *action = strchr(usl->value, ' ');
+			if (!action) {
+				uwsgi_log("invalid setns hook syntax, must be \"namespaces_list action:...\"\n");
+				exit(1);
+			}
+			char *pidstr = uwsgi_num2str(pid);
+			char *uidstr = uwsgi_num2str(uid);
+			char *gidstr = uwsgi_num2str(gid);
 
-		if (private) {
-			uwsgi_log("running --- PRIVATE HOOK --- (%s)...\n", phase);
+			char *namespaces = uwsgi_concat2n(usl->value, action-usl->value, "", 0);
+        		char *p, *ctx = NULL;
+        		uwsgi_foreach_token(namespaces, ",", p, ctx) {
+				char *procfile = uwsgi_concat4("/proc/", pidstr, "/ns/", p);
+				int fd = open(procfile, O_RDONLY);
+				if (fd < 0) {
+					uwsgi_error_open(procfile);
+					exit(1);
+				}
+				if (u_setns(fd, 0) < 0){
+					uwsgi_error("uwsgi_hooks_setns_run()/setns()");
+					exit(1);
+				}
+				close(fd);
+				free(procfile);
+                	}
+
+			if (setenv("UWSGI_VASSAL_PID", pidstr, 1)) {
+				uwsgi_error("uwsgi_hooks_setns_run()/setenv()");
+				exit(1);
+			}
+
+			if (setenv("UWSGI_VASSAL_UID", uidstr, 1)) {
+				uwsgi_error("uwsgi_hooks_setns_run()/setenv()");
+				exit(1);
+			}
+
+			if (setenv("UWSGI_VASSAL_GID", gidstr, 1)) {
+				uwsgi_error("uwsgi_hooks_setns_run()/setenv()");
+				exit(1);
+			}
+
+			// now run the action and then exit
+			action++;
+			char *colon = strchr(action, ':');
+			if (!colon) {
+				uwsgi_log("invalid hook syntax must be action:arg\n");
+				exit(1);
+			}
+			*colon = 0;
+			struct uwsgi_hook *uh = uwsgi_hook_by_name(action);
+                	if (!uh) {
+                        	uwsgi_log("hook action not found: %s\n", action);
+                        	exit(1);
+                	}
+                	*colon = ':';
+
+                        uwsgi_log("running \"%s\" (setns)...\n", usl->value);
+                	exit(uh->func(colon+1));
 		}
 		else {
-			uwsgi_log("running \"%s\" (%s)...\n", usl->value, phase);
-		}
-			
-		int ret = uh->func(colon+1);
-		if (fatal && ret != 0) {
-			uwsgi_log_verbose("FATAL hook failed, destroying instance\n");
-			if (uwsgi.master_process) {
-				if (uwsgi.workers) {
-					if (uwsgi.workers[0].pid == getpid()) {
-						kill_them_all(0);
-						return;
-					}
-					else {
-                                        	if (kill(uwsgi.workers[0].pid, SIGINT)) {
-							uwsgi_error("uwsgi_hooks_run()/kill()");
-							exit(1);
-						}
-						return;
-                                	}
-				}
-			}
-			exit(1);
+			uwsgi_error("uwsgi_hooks_setns_run()/fork()");
 		}
 	}
 }
+#endif

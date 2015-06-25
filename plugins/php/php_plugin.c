@@ -1,16 +1,10 @@
-#include "php.h"
-#include "SAPI.h"
-#include "php_main.h"
-#include "php_variables.h"
-
-#include "ext/standard/php_smart_str.h"
-#include "ext/standard/info.h"
-
-#include "../../uwsgi.h"
+#include "common.h"
 
 extern struct uwsgi_server uwsgi;
 
 static sapi_module_struct uwsgi_sapi_module;
+
+static int uwsgi_php_init(void);
 
 struct uwsgi_php {
 	struct uwsgi_string_list *allowed_docroot;
@@ -34,11 +28,19 @@ struct uwsgi_php {
 
 	struct uwsgi_string_list *exec_before;
 	struct uwsgi_string_list *exec_after;
+
+	char *sapi_name;
+
+	int sapi_initialized;
 } uphp;
 
 void uwsgi_opt_php_ini(char *opt, char *value, void *foobar) {
 	uwsgi_sapi_module.php_ini_path_override = uwsgi_str(value);
         uwsgi_sapi_module.php_ini_ignore = 1;
+}
+
+void uwsgi_opt_early_php(char *opt, char *value, void *foobar) {
+	uwsgi_php_init();
 }
 
 struct uwsgi_option uwsgi_php_options[] = {
@@ -66,6 +68,10 @@ struct uwsgi_option uwsgi_php_options[] = {
         {"php-exec-begin", required_argument, 0, "run specified php code before the requested script", uwsgi_opt_add_string_list, &uphp.exec_before, 0},
         {"php-exec-after", required_argument, 0, "run specified php code after the requested script", uwsgi_opt_add_string_list, &uphp.exec_after, 0},
         {"php-exec-end", required_argument, 0, "run specified php code after the requested script", uwsgi_opt_add_string_list, &uphp.exec_after, 0},
+        {"php-sapi-name", required_argument, 0, "hack the sapi name (required for enabling zend opcode cache)", uwsgi_opt_set_str, &uphp.sapi_name, 0},
+
+        {"early-php", no_argument, 0, "initialize an early perl interpreter shared by all loaders", uwsgi_opt_early_php, NULL, UWSGI_OPT_IMMEDIATE},
+        {"early-php-sapi-name", required_argument, 0, "hack the sapi name (required for enabling zend opcode cache)", uwsgi_opt_set_str, &uphp.sapi_name, UWSGI_OPT_IMMEDIATE},
 	UWSGI_END_OF_OPTIONS
 };
 
@@ -82,7 +88,7 @@ static int sapi_uwsgi_ub_write(const char *str, uint str_length TSRMLS_DC)
 	return str_length;
 }
 
-static int sapi_uwsgi_send_headers(sapi_headers_struct *sapi_headers)
+static int sapi_uwsgi_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
 {
 	sapi_header_struct *h;
 	zend_llist_position pos;
@@ -140,7 +146,7 @@ static int sapi_uwsgi_read_post(char *buffer, uint count_bytes TSRMLS_DC)
 }
 
 
-static char *sapi_uwsgi_read_cookies(void)
+static char *sapi_uwsgi_read_cookies(TSRMLS_D)
 {
 	uint16_t len = 0;
 	struct wsgi_request *wsgi_req = (struct wsgi_request *) SG(server_context);
@@ -184,11 +190,11 @@ static void sapi_uwsgi_register_variables(zval *track_vars_array TSRMLS_DC)
 	php_register_variable_safe("DOCUMENT_ROOT", wsgi_req->document_root, wsgi_req->document_root_len, track_vars_array TSRMLS_CC);
 
 	if (wsgi_req->path_info_len) {
-		char *path_translated = ecalloc(1, (wsgi_req->file_len - wsgi_req->script_name_len) + wsgi_req->path_info_len + 1);
+		char *path_translated = ecalloc(1, wsgi_req->file_len + wsgi_req->path_info_len + 1);
 
-		memcpy(path_translated, wsgi_req->file, (wsgi_req->file_len - wsgi_req->script_name_len));
-		memcpy(path_translated + (wsgi_req->file_len - wsgi_req->script_name_len), wsgi_req->path_info, wsgi_req->path_info_len);
-		php_register_variable_safe("PATH_TRANSLATED", path_translated, (wsgi_req->file_len - wsgi_req->script_name_len) + wsgi_req->path_info_len , track_vars_array TSRMLS_CC);
+		memcpy(path_translated, wsgi_req->file, wsgi_req->file_len);
+		memcpy(path_translated + wsgi_req->file_len, wsgi_req->path_info, wsgi_req->path_info_len);
+		php_register_variable_safe("PATH_TRANSLATED", path_translated, wsgi_req->file_len + wsgi_req->path_info_len , track_vars_array TSRMLS_CC);
 	}
 	else {
 		php_register_variable_safe("PATH_TRANSLATED", "", 0, track_vars_array TSRMLS_CC);
@@ -233,8 +239,9 @@ void uwsgi_php_set(char *opt) {
 	uwsgi_sapi_module.ini_entries[uphp.ini_size] = 0;
 }
 
-// future implementation...
+extern ps_module ps_mod_uwsgi;
 PHP_MINIT_FUNCTION(uwsgi_php_minit) {
+	php_session_register_module(&ps_mod_uwsgi);
 	return SUCCESS;
 }
 
@@ -258,8 +265,9 @@ PHP_FUNCTION(uwsgi_cache_exists) {
         char *key = NULL;
         int keylen = 0;
         char *cache = NULL;
+        int cachelen = 0;
 
-        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &key, &keylen, &cache) == FAILURE) {
+        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &key, &keylen, &cache, &cachelen) == FAILURE) {
                 RETURN_NULL();
         }
 
@@ -273,8 +281,9 @@ PHP_FUNCTION(uwsgi_cache_exists) {
 PHP_FUNCTION(uwsgi_cache_clear) {
 
         char *cache = NULL;
+        int cachelen = 0;
 
-        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|s", &cache) == FAILURE) {
+        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|s", &cache, &cachelen) == FAILURE) {
                 RETURN_NULL();
         }
 
@@ -291,8 +300,9 @@ PHP_FUNCTION(uwsgi_cache_del) {
 	char *key = NULL;
         int keylen = 0;
 	char *cache = NULL;
+	int cachelen = 0;
 
-        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &key, &keylen, &cache) == FAILURE) {
+        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &key, &keylen, &cache, &cachelen) == FAILURE) {
                 RETURN_NULL();
         }
 
@@ -308,12 +318,13 @@ PHP_FUNCTION(uwsgi_cache_get) {
 	char *key = NULL;
 	int keylen = 0;
 	char *cache = NULL;
+	int cachelen = 0;
 	uint64_t valsize;
 
 	if (!uwsgi.caches)
 		RETURN_NULL();
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &key, &keylen, &cache) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &key, &keylen, &cache, &cachelen) == FAILURE) {
                 RETURN_NULL();
         }
 
@@ -333,15 +344,16 @@ PHP_FUNCTION(uwsgi_cache_set) {
 	int vallen;
 	uint64_t expires = 0;
 	char *cache = NULL;
+	int cachelen = 0;
 
 	if (!uwsgi.caches)
 		RETURN_NULL();
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|ls", &key, &keylen, &value, &vallen, &expires, &cache) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|ls", &key, &keylen, &value, &vallen, &expires, &cache, &cachelen) == FAILURE) {
                 RETURN_NULL();
         }
 
-	if (uwsgi_cache_magic_set(key, keylen, value, vallen, expires, 0, cache)) {
+	if (!uwsgi_cache_magic_set(key, keylen, value, vallen, expires, 0, cache)) {
 		RETURN_TRUE;
 	}
 	RETURN_NULL();
@@ -355,15 +367,16 @@ PHP_FUNCTION(uwsgi_cache_update) {
         int vallen;
         uint64_t expires = 0;
         char *cache = NULL;
+        int cachelen = 0;
 
         if (!uwsgi.caches)
                 RETURN_NULL();
 
-        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|ls", &key, &keylen, &value, &vallen, &expires, &cache) == FAILURE) {
+        if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|ls", &key, &keylen, &value, &vallen, &expires, &cache, &cachelen) == FAILURE) {
                 RETURN_NULL();
         }
 
-        if (uwsgi_cache_magic_set(key, keylen, value, vallen, expires, UWSGI_CACHE_FLAG_UPDATE, cache)) {
+        if (!uwsgi_cache_magic_set(key, keylen, value, vallen, expires, UWSGI_CACHE_FLAG_UPDATE, cache)) {
                 RETURN_TRUE;
         }
         RETURN_NULL();
@@ -516,7 +529,7 @@ static int php_uwsgi_startup(sapi_module_struct *sapi_module)
 	}
 }
 
-static void sapi_uwsgi_log_message(char *message) {
+static void sapi_uwsgi_log_message(char *message TSRMLS_DC) {
 
 	uwsgi_log("%s\n", message);
 }
@@ -552,12 +565,18 @@ static sapi_module_struct uwsgi_sapi_module = {
 	STANDARD_SAPI_MODULE_PROPERTIES
 };
 
-int uwsgi_php_init(void) {
+static int uwsgi_php_init(void) {
 
 	struct uwsgi_string_list *pset = uphp.set;
 	struct uwsgi_string_list *append_config = uphp.append_config;
 
-	sapi_startup(&uwsgi_sapi_module);
+	if (!uphp.sapi_initialized) {
+#ifdef ZTS
+        	tsrm_startup(1, 1, 0, NULL);
+#endif
+		sapi_startup(&uwsgi_sapi_module);
+		uphp.sapi_initialized = 1;
+	}
 
 	// applying custom options
 	while(append_config) {
@@ -585,8 +604,11 @@ int uwsgi_php_init(void) {
 		}
 	}
 
-	uwsgi_sapi_module.startup(&uwsgi_sapi_module);
+	if (uphp.sapi_name) {
+		uwsgi_sapi_module.name = uphp.sapi_name;
+	}
 
+	uwsgi_sapi_module.startup(&uwsgi_sapi_module);
 	uwsgi_log("PHP %s initialized\n", PHP_VERSION);
 
 	return 0;
@@ -655,14 +677,22 @@ int uwsgi_php_request(struct wsgi_request *wsgi_req) {
 	size_t real_filename_len = 0;
 	struct stat php_stat;
 	char *filename = NULL;
+	int force_empty_script_name = 0;
 
 	zend_file_handle file_handle;
+
+#ifdef ZTS
+	TSRMLS_FETCH();
+#endif
 
 	SG(server_context) = (void *) wsgi_req;
 
 	if (uwsgi_parse_vars(wsgi_req)) {
 		return -1;
 	}
+
+	char *orig_path_info = wsgi_req->path_info;
+	uint16_t orig_path_info_len = wsgi_req->path_info_len;
 
 	if (uphp.docroot) {
 		wsgi_req->document_root = uphp.docroot;
@@ -720,6 +750,7 @@ int uwsgi_php_request(struct wsgi_request *wsgi_req) {
 appready:
 		wsgi_req->path_info = "";
 		wsgi_req->path_info_len = 0;
+		force_empty_script_name = 1;
 		goto secure2;
 	}
 
@@ -739,10 +770,6 @@ oldstyle:
 			return -1;
 		}
 	}
-
-
-	char *orig_path_info = wsgi_req->path_info;
-	uint16_t orig_path_info_len = wsgi_req->path_info_len;
 
 	if (path_info) {
 		wsgi_req->path_info = path_info;
@@ -853,23 +880,24 @@ secure2:
         }
 
 secure3:
-
-	if (wsgi_req->document_root[wsgi_req->document_root_len-1] == '/') {
-		wsgi_req->script_name = real_filename + (wsgi_req->document_root_len-1);
+	if (force_empty_script_name) {
+		wsgi_req->script_name = "";
+		wsgi_req->script_name_len = 0;
 	}
 	else {
-		wsgi_req->script_name = real_filename + wsgi_req->document_root_len;
+		wsgi_req->script_name = orig_path_info;
+		if (path_info) {
+			wsgi_req->script_name_len = path_info - orig_path_info;
+		}
+		else {
+			wsgi_req->script_name_len = orig_path_info_len;
+		}
 	}
-
-	wsgi_req->script_name_len = strlen(wsgi_req->script_name);
 
 #ifdef UWSGI_DEBUG
 	uwsgi_log("php filename = %s script_name = %.*s (%d) document_root = %.*s (%d)\n", real_filename, wsgi_req->script_name_len, wsgi_req->script_name, wsgi_req->script_name_len,
 		wsgi_req->document_root_len, wsgi_req->document_root, wsgi_req->document_root_len);
 #endif
-
-
-
 
 	// now check for allowed paths and extensions
 

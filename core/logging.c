@@ -3,6 +3,7 @@
 #endif
 #if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
 #include <sys/user.h>
+#include <sys/sysctl.h>
 #include <kvm.h>
 #elif defined(__sun__)
 /* Terrible Hack !!! */
@@ -11,10 +12,6 @@
 #endif
 #include <procfs.h>
 #define _FILE_OFFSET_BITS 64
-#endif
-
-#if defined(__NetBSD__) || defined(__FreeBSD__) || defined(__DragonFly__)
-#include <sys/sysctl.h>
 #endif
 
 #ifdef __DragonFly__
@@ -294,26 +291,34 @@ void logto(char *logfile) {
 		uwsgi.logfile = logfile;
 
 		if (uwsgi.chmod_logfile_value) {
-			if (chmod(uwsgi.logfile, uwsgi.chmod_logfile_value)) {
-				uwsgi_error("chmod()");
+			if (fchmod(fd, uwsgi.chmod_logfile_value)) {
+				uwsgi_error("fchmod()");
 			}
 		}
 	}
 
 
-	/* stdout */
-	if (fd != 1) {
-		if (dup2(fd, 1) < 0) {
+	// if the log-master is already active, just re-set the original_log_fd
+	if (uwsgi.shared->worker_log_pipe[0] == -1) {
+		/* stdout */
+		if (fd != 1) {
+			if (dup2(fd, 1) < 0) {
+				uwsgi_error("dup2()");
+				exit(1);
+			}
+			close(fd);
+		}
+
+		/* stderr */
+		if (dup2(1, 2) < 0) {
 			uwsgi_error("dup2()");
 			exit(1);
 		}
-		close(fd);
-	}
 
-	/* stderr */
-	if (dup2(1, 2) < 0) {
-		uwsgi_error("dup2()");
-		exit(1);
+		 uwsgi.original_log_fd = 2;
+	}
+	else {
+		uwsgi.original_log_fd = fd;
 	}
 }
 
@@ -346,51 +351,51 @@ void uwsgi_setup_log() {
 
 static struct uwsgi_logger *setup_choosen_logger(struct uwsgi_string_list *usl) {
 	char *id = NULL;
-                char *name = usl->value;
+	char *name = usl->value;
 
-                char *space = strchr(name, ' ');
-                if (space) {
-                        int is_id = 1;
-                        int i;
-                        for (i = 0; i < (space - name); i++) {
-                                if (!isalnum((int)name[i])) {
-                                        is_id = 0;
-                                        break;
-                                }
-                        }
-                        if (is_id) {
-                                id = uwsgi_concat2n(name, space - name, "", 0);
-                                name = space + 1;
-                        }
-                }
+	char *space = strchr(name, ' ');
+	if (space) {
+		int is_id = 1;
+		int i;
+		for (i = 0; i < (space - name); i++) {
+			if (!isalnum((int)name[i])) {
+				is_id = 0;
+				break;
+			}
+		}
+		if (is_id) {
+			id = uwsgi_concat2n(name, space - name, "", 0);
+			name = space + 1;
+		}
+	}
 
-                char *colon = strchr(name, ':');
-                if (colon) {
-                        *colon = 0;
-                }
+	char *colon = strchr(name, ':');
+	if (colon) {
+		*colon = 0;
+	}
 
-                struct uwsgi_logger *choosen_logger = uwsgi_get_logger(name);
-                if (!choosen_logger) {
-                        uwsgi_log("unable to find logger %s\n", name);
-                        exit(1);
-                }
+	struct uwsgi_logger *choosen_logger = uwsgi_get_logger(name);
+	if (!choosen_logger) {
+		uwsgi_log("unable to find logger %s\n", name);
+		exit(1);
+	}
 
-                // make a copy of the logger
-                struct uwsgi_logger *copy_of_choosen_logger = uwsgi_malloc(sizeof(struct uwsgi_logger));
-                memcpy(copy_of_choosen_logger, choosen_logger, sizeof(struct uwsgi_logger));
-                choosen_logger = copy_of_choosen_logger;
-                choosen_logger->id = id;
-                choosen_logger->next = NULL;
+	// make a copy of the logger
+	struct uwsgi_logger *copy_of_choosen_logger = uwsgi_malloc(sizeof(struct uwsgi_logger));
+	memcpy(copy_of_choosen_logger, choosen_logger, sizeof(struct uwsgi_logger));
+	choosen_logger = copy_of_choosen_logger;
+	choosen_logger->id = id;
+	choosen_logger->next = NULL;
 
-                if (colon) {
-                        choosen_logger->arg = colon + 1;
-                        // check for empty string
-                        if (*choosen_logger->arg == 0) {
-                                choosen_logger->arg = NULL;
-                        }
-                        *colon = ':';
-                }
-		return choosen_logger;
+	if (colon) {
+		choosen_logger->arg = colon + 1;
+		// check for empty string
+		if (*choosen_logger->arg == 0) {
+			choosen_logger->arg = NULL;
+		}
+		*colon = ':';
+	}
+	return choosen_logger;
 }
 
 void uwsgi_setup_log_master(void) {
@@ -511,40 +516,46 @@ void uwsgi_check_logrotate(void) {
 	}
 }
 
-void uwsgi_log_rotate() {
-	if (!uwsgi.logfile) return;
-	char *rot_name = uwsgi.log_backupname;
-                int need_free = 0;
-                if (rot_name == NULL) {
-                        char *ts_str = uwsgi_num2str((int) uwsgi_now());
-                        rot_name = uwsgi_concat3(uwsgi.logfile, ".", ts_str);
-                        free(ts_str);
-                        need_free = 1;
-                }
-		// this will be rawly written to the logfile
-                uwsgi_logfile_write("logsize: %llu, triggering rotation to %s...\n", (unsigned long long) uwsgi.shared->logsize, rot_name);
-                if (rename(uwsgi.logfile, rot_name) == 0) {
-                        // reopen logfile and dup'it, on dup2 error, exit(1)
-                        int fd = open(uwsgi.logfile, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP);
-                        if (fd < 0) {
-				// this will be written to the original file
-                                uwsgi_error_open(uwsgi.logfile);
+void uwsgi_log_do_rotate(char *logfile, char *rotatedfile, off_t logsize, int log_fd) {
+	int need_free = 0;
+	char *rot_name = rotatedfile;
+
+	if (rot_name == NULL) {
+		char *ts_str = uwsgi_num2str((int) uwsgi_now());
+		rot_name = uwsgi_concat3(logfile, ".", ts_str);
+		free(ts_str);
+		need_free = 1;
+	}
+	// this will be rawly written to the logfile
+	uwsgi_logfile_write("logsize: %llu, triggering rotation to %s...\n", (unsigned long long) logsize, rot_name);
+	if (rename(logfile, rot_name) == 0) {
+		// reopen logfile and dup'it, on dup2 error, exit(1)
+		int fd = open(logfile, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP);
+		if (fd < 0) {
+			// this will be written to the original file
+			uwsgi_error_open(logfile);
+			exit(1);
+		}
+		else {
+			if (dup2(fd, log_fd) < 0) {
+				// this could be lost :(
+				uwsgi_error("uwsgi_log_do_rotate()/dup2()");
 				exit(1);
-                        }
-                        else {
-                                if (dup2(fd, uwsgi.original_log_fd) < 0) {
-					// this could be lost :(
-                                        uwsgi_error("uwsgi_log_rotate()/dup2()");
-					exit(1);
-                                }
-                                close(fd);
-                        }
-                }
-                else {
-                        uwsgi_error("unable to rotate log: rename()");
-                }
-                if (need_free)
-                        free(rot_name);
+			}
+			close(fd);
+		}
+	}
+	else {
+		uwsgi_error("unable to rotate log: rename()");
+	}
+	if (need_free)
+		free(rot_name);
+}
+
+void uwsgi_log_rotate() {
+	if (!uwsgi.logfile)
+		return;
+	uwsgi_log_do_rotate(uwsgi.logfile, uwsgi.log_backupname, uwsgi.shared->logsize, uwsgi.original_log_fd);
 }
 
 void uwsgi_log_reopen() {
@@ -701,12 +712,12 @@ void uwsgi_logit_simple(struct wsgi_request *wsgi_req) {
 
 	}
 
-	rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] %.*s (%.*s) {%d vars in %d bytes} [%.*s] %.*s %.*s => generated %llu bytes in %llu %s%s(%.*s %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->remote_addr_len, wsgi_req->remote_addr, wsgi_req->remote_user_len, wsgi_req->remote_user, wsgi_req->var_cnt, wsgi_req->uh->pktsize,
+	rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] %.*s (%.*s) {%d vars in %llu bytes} [%.*s] %.*s %.*s => generated %llu bytes in %llu %s%s(%.*s %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->remote_addr_len, wsgi_req->remote_addr, wsgi_req->remote_user_len, wsgi_req->remote_user, wsgi_req->var_cnt, (unsigned long long) wsgi_req->len,
 			24, time_request, wsgi_req->method_len, wsgi_req->method, wsgi_req->uri_len, wsgi_req->uri, (unsigned long long) wsgi_req->response_size, (unsigned long long) rt, tsize, via, wsgi_req->protocol_len, wsgi_req->protocol, wsgi_req->status, wsgi_req->header_cnt, (unsigned long long) wsgi_req->headers_size, wsgi_req->switches, wsgi_req->async_id);
 
 	// not enough space for logging the request, just log a (safe) minimal message
 	if (rlen > 4096) {
-		rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] 0.0.0.0 () {%d vars in %d bytes} [%.*s] - - => generated %llu bytes in %llu %s%s(- %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->var_cnt, wsgi_req->uh->pktsize,
+		rlen = snprintf(logpkt, 4096, "[pid: %d|app: %d|req: %d/%llu] 0.0.0.0 () {%d vars in %llu bytes} [%.*s] - - => generated %llu bytes in %llu %s%s(- %d) %d headers in %llu bytes (%d switches on core %d)\n", (int) uwsgi.mypid, wsgi_req->app_id, app_req, (unsigned long long) uwsgi.workers[0].requests, wsgi_req->var_cnt, (unsigned long long) wsgi_req->len,
 		24, time_request, (unsigned long long) wsgi_req->response_size, (unsigned long long) rt, tsize, via, wsgi_req->status, wsgi_req->header_cnt, (unsigned long long) wsgi_req->headers_size, wsgi_req->switches, wsgi_req->async_id);
 		// argh, last resort, truncate it
 		if (rlen > 4096) {
@@ -1201,7 +1212,7 @@ static ssize_t uwsgi_lf_rssM(struct wsgi_request * wsgi_req, char **buf) {
 }
 
 static ssize_t uwsgi_lf_pktsize(struct wsgi_request * wsgi_req, char **buf) {
-	*buf = uwsgi_num2str(wsgi_req->uh->pktsize);
+	*buf = uwsgi_num2str(wsgi_req->len);
 	return strlen(*buf);
 }
 
@@ -1845,7 +1856,7 @@ static char *uwsgi_log_encoder_json(struct uwsgi_log_encoder *ule, char *msg, si
                         if (!uwsgi_strncmp(usl->value, usl->len, "msg", 3)) {
 				size_t msg_len = len;
                                 if (msg[len-1] == '\n') msg_len--;
-				char *e_json = uwsgi_malloc(msg_len * 2);
+				char *e_json = uwsgi_malloc((msg_len * 2)+1);
 				escape_json(msg, msg_len, e_json);
 				if (uwsgi_buffer_append(ub, e_json, strlen(e_json))){
                                 	free(e_json);
@@ -1854,7 +1865,7 @@ static char *uwsgi_log_encoder_json(struct uwsgi_log_encoder *ule, char *msg, si
                                 free(e_json);
                         }
                         else if (!uwsgi_strncmp(usl->value, usl->len, "msgnl", 5)) {
-				char *e_json = uwsgi_malloc(len * 2);
+				char *e_json = uwsgi_malloc((len * 2)+1);
                                 escape_json(msg, len, e_json);
                                 if (uwsgi_buffer_append(ub, e_json, strlen(e_json))){
                                         free(e_json);
@@ -1875,7 +1886,7 @@ static char *uwsgi_log_encoder_json(struct uwsgi_log_encoder *ule, char *msg, si
                                 int strftime_len = strftime(sftime, 64, buf, localtime(&now));
                                 free(buf);
                                 if (strftime_len > 0) {
-					char *e_json = uwsgi_malloc(strftime_len * 2);
+					char *e_json = uwsgi_malloc((strftime_len * 2)+1);
 					escape_json(sftime, strftime_len, e_json);
                                         if (uwsgi_buffer_append(ub, e_json, strlen(e_json))){
 						free(e_json);

@@ -66,31 +66,13 @@ SV * coroae_coro_new(CV *block) {
 }
 
 static int coroae_wait_milliseconds(int timeout) {
-        int ret = -1;
-        dSP;
-        ENTER;
-        SAVETMPS;
-        PUSHMARK(SP);
-        XPUSHs(newSVnv(((double)timeout)/1000.0));
-        PUTBACK;
-        call_pv("Coro::AnyEvent::sleep", G_SCALAR|G_EVAL);
-        SPAGAIN;
-        if(SvTRUE(ERRSV)) {
-                uwsgi_log("[uwsgi-perl error] %s", SvPV_nolen(ERRSV));
-        }
-        else {
-                SV *p_ret = POPs;
-                if (SvTRUE(p_ret)) {
-                        ret = 0;
-                }
-        }
-        PUTBACK;
-        FREETMPS;
-        LEAVE;
-
-        return ret;
+	char buf[256];
+	double d = ((double)timeout)/1000.0;
+	int ret = snprintf(buf, 256, "Coro::AnyEvent::sleep %f", d);
+	if (ret <= 0 || ret > 256) return -1;
+	perl_eval_pv(buf, 0);
+	return 0;
 }
-
 
 static int coroae_wait_fd_read(int fd, int timeout) {
 	int ret = 0;
@@ -205,7 +187,7 @@ end:
 
 XS(XS_coroae_sighandler) {
 	int sigfd = (long) XSANY.any_ptr;
-	uwsgi_receive_signal(sigfd, "worker", uwsgi.mywid);
+	uwsgi_receive_signal(NULL, sigfd, "worker", uwsgi.mywid);
 }
 
 XS(XS_coroae_acceptor) {
@@ -245,7 +227,7 @@ edge:
 
         // enter harakiri mode
         if (uwsgi.harakiri_options.workers > 0) {
-                set_harakiri(uwsgi.harakiri_options.workers);
+                set_harakiri(wsgi_req, uwsgi.harakiri_options.workers);
         }
 
 
@@ -374,7 +356,7 @@ static void coroae_wait_condvar(SV *cv) {
 
 static void coroae_loop() {
 
-	if (uwsgi.async < 2) {
+	if (uwsgi.async < 1) {
 		if (uwsgi.mywid == 1) {
 			uwsgi_log("the Coro::AnyEvent loop engine requires async mode (--async <n>)\n");
 		}
